@@ -1,0 +1,1166 @@
+# The cost model: how computations map to gate levels
+
+Every `depth` figure this package reports is **gate levels on the critical path** —
+logic depth, i.e. latency. Not a count of adders, multipliers, gates or operations.
+This page states the whole mapping, so it can be checked and argued with.
+
+!!! warning "This is a first-order model, and it is stated so you can disagree with it"
+    The *values* the package computes are real: `rr4_add` is executed, `quick_snr`
+    measures, `accumulate_rr4` verifies exactness against a reference sum. The **costs
+    on this page are a model**, calibrated to reproduce two textbook facts — Booth
+    halves the partial-product rows, carry-free addition is depth 3 at any width — and
+    to make the state penalty visible. It is not a substitute for synthesis. Read
+    ratios between rows, not absolute numbers, and see
+    [Known simplifications](@ref) below for where it is deliberately coarse.
+
+## 1. What one "level" means
+
+**One level = one full-adder-equivalent stage.** Not one 2-input gate.
+
+This is the conventional accounting for comparing addition schedules, and it is the
+only self-consistent choice here: a 3:2 compressor, a prefix combine cell and one stage
+of RR4 transfer logic are all "one small fixed-depth block", and charging each of them
+1 keeps the comparison about *schedule* rather than about cell libraries.
+
+Consequences worth stating up front:
+
+* A level is **not a uniform physical delay**. A full adder is two XOR delays; a prefix
+  combine cell is an AND-OR. Levels are comparable *to each other within this model*,
+  not convertible to nanoseconds.
+* Depth is **not throughput**. A deeply pipelined ripple adder can match a prefix
+  adder's throughput while keeping its depth. Nothing here models pipelining.
+* Cheap single-gate layers (the generate/propagate pre-compute, the final sum XOR) are
+  **folded into the stage counts** rather than charged separately. Section
+  [Known simplifications](@ref) shows what changes if you charge them.
+
+## 1a. What a level is *physically*
+
+A level is one full-adder-equivalent stage. In process-portable terms that is
+**2–3 FO4** — FO4 being the delay of an inverter driving four identical inverters, the
+standard unit for comparing logic delay across processes.
+
+| gate | ≈ FO4 |
+|:---|---:|
+| 2-input NAND / NOR | 1 |
+| 2-input XOR | 1.5 – 2 |
+| AOI prefix combine cell | 1 – 1.5 |
+| 2:1 mux | 1 – 1.5 |
+| **full adder / 3:2 compressor** | **2 – 3** |
+
+A full adder's sum path is two XORs, which is where the 2–3 comes from.
+[`fo4_range`](@ref) does the conversion.
+
+### What that means for the clock budget
+
+Aggressive CPU pipelines run roughly **12–20 FO4** per cycle; throughput-oriented
+accelerator datapaths are more relaxed, 20–40. So `levels_per_cycle` maps to:
+
+| `L` | FO4 per cycle | design point |
+|---:|:---|:---|
+| 4 | 8 – 12 | very aggressive |
+| 8 | 16 – 24 | aggressive |
+| **16** | **32 – 48** | **relaxed / throughput-oriented — the package default** |
+| 32 | 64 – 96 | very relaxed |
+
+!!! warning "The default is on the relaxed side, and it affects a conclusion"
+    `DEFAULT_LEVELS_PER_CYCLE = 16` is a *throughput-datapath* budget, not an
+    aggressive-CPU one. §10 concludes that redundancy's depth win is invisible in
+    cycles — that holds at `L = 16` **and** at `L = 8`, but at `L = 4` (a real if
+    demanding design point) a carry-free 64-bit adder is 1 cycle against a prefix
+    adder's 2. The crossover sits near `L = 4–6`, so "redundancy buys no cycles" is
+    true for mainstream clock targets and **false at the most aggressive ones**.
+
+## 1b. Worked example — one FP32 × FP32 multiply
+
+[`float_multiply_stages`](@ref) prices the same stages [`fpmul`](@ref) executes, so the
+cost model and the value model describe one datapath.
+
+FP32 is 1 sign + 8 exponent + 23 stored mantissa, so the significand is **24 bits** with
+the implicit leading 1, and the product is 48.
+
+```
+     a = [s|  E_a  |      M_a      ]        b = [s|  E_b  |      M_b      ]
+          1    8            23                   1    8            23
+          │    │            │                    │    │            │
+    ┌─────┴────┴────────────┴────────────────────┴────┴────────────┴─────┐
+    │  unpack: split fields, prepend implicit 1  →  24-bit significands  │  1 level
+    └──┬──────────────┬─────────────────────────────────────────────┬────┘
+       │              │                                            │
+   ┌───▼───┐   ┌──────▼───────┐              ┌────────────────────▼─────────────┐
+   │ sign  │   │ exponent add │              │   SIGNIFICAND MULTIPLY 24×24     │
+   │ s_a⊕s_b│  │ E_a+E_b−127  │              │                                  │
+   │ 1 lvl │   │   3 levels   │              │  Booth radix-4 recode      1 lvl │
+   └───┬───┘   └──────┬───────┘              │  13 partial-product rows         │
+       │              │                      │  → CSA tree (Wallace)      5 lvl │
+       │  ── parallel, not critical ──       │  → exit CPA over 48 bits   6 lvl │
+       │              │                      │                    total 12 lvl  │
+       │              │                      └────────────────┬─────────────────┘
+       │              │                                       │  48-bit product
+       │              │                      ┌────────────────▼─────────────────┐
+       │              │                      │ normalise: product ∈ [1,4), so a │  1 level
+       │              │                      │ 1-bit conditional right shift    │
+       │              │                      └────────────────┬─────────────────┘
+       │              │                      ┌────────────────▼─────────────────┐
+       │              │                      │ round to nearest even: guard/    │  5 levels
+       │              │                      │ round/sticky + 24-bit increment  │
+       │              │                      └────────────────┬─────────────────┘
+       │              │                      ┌────────────────▼─────────────────┐
+       │              │                      │ post-normalise: rounding can     │  1 level
+       │              │                      │ carry out (1.111→10.000)         │
+       │              │                      └────────────────┬─────────────────┘
+       └──────────────┴───────────────┬──────────────────────┘
+                          ┌───────────▼────────────┐
+                          │ pack + Inf/NaN/zero/   │                              2 levels
+                          │ overflow selection     │
+                          └───────────┬────────────┘
+                                      ▼
+                              [s|  E  |    M    ]
+
+   CRITICAL PATH = 1 + 12 + 1 + 5 + 1 + 2 = 22 levels
+```
+
+| stage | levels | on critical path? |
+|:---|---:|:---|
+| unpack | 1 | yes |
+| sign | 1 | **parallel** |
+| exponent add | 3 | **parallel** |
+| significand multiply (24×24 Booth-Wallace) | **12** | yes |
+| normalise | 1 | yes |
+| round | 5 | yes |
+| post-normalise | 1 | yes |
+| pack / specials | 2 | yes |
+| **critical total** | **22** | |
+
+**The shape of an FP multiplier is one big integer multiply with a little exponent
+arithmetic alongside it.** The 8-bit exponent add is 3 levels and the sign is 1; both
+finish long before the 12-level significand multiply and never touch the critical path.
+Note also that **rounding costs 5 levels — nearly half the multiply itself** — which is
+why block formats that make the core sum exact (no rounding, no normaliser) win more
+than their bit-width suggests.
+
+### In FO4, and in cycles
+
+22 levels ≈ **44–66 FO4**. Converting at each clock budget:
+
+| `L` | FO4/cycle | cycles for one FP32 multiply |
+|---:|:---|---:|
+| 4 | 8–12 | 6 |
+| 8 | 16–24 | 3 |
+| 16 | 32–48 | 2 |
+| 32 | 64–96 | 1 |
+
+Real FP32 multipliers are typically **3–5 pipeline stages**, which brackets the `L = 4`
+and `L = 8` rows — a reasonable sanity check that the model is in the right territory,
+and a further sign that `L = 16` is the relaxed end.
+
+### The same multiply across formats
+
+Depth is dominated by the significand width `p`, and it grows only logarithmically:
+
+| format | `p` | depth |
+|:---|---:|---:|
+| E2M1 (FP4) | 2 | 9 |
+| E4M3 (FP8) | 4 | 12 |
+| BF16 | 8 | 16 |
+| FP16 | 11 | 18 |
+| FP32 | 24 | 22 |
+| FP64 | 53 | 26 |
+
+**FP64 is only 1.2× the depth of FP32 despite 2.2× the significand** — a Wallace tree is
+logarithmic in the row count. The cost of wide formats is *area* (`p²` partial-product
+cells) and *memory*, not latency. That is the same lesson the MXFP4 analysis reaches
+from the other direction: at `p = 2` the multiply is a 64-entry ROM and the arithmetic
+has essentially vanished, leaving memory as the only thing that matters.
+
+## 2. The primitives
+
+| primitive | levels | why |
+|:---|---:|:---|
+| full adder / 3:2 compressor | **1** | three bits in, two out, fixed depth |
+| prefix combine cell `(g,p)∘(g',p')` | **1** | one AND-OR stage |
+| RR4 column sum | **1** | `sᵢ = xᵢ + yᵢ`, two bounded digits |
+| RR4 transfer | **1** | `tᵢ` from `sᵢ` (and `sᵢ₋₁` in the minimal alphabet) |
+| RR4 digit | **1** | `zᵢ = (sᵢ − 4tᵢ) + tᵢ₋₁` |
+| ROM / LUT access | **2** | address decode, then output mux |
+| exponent add (E8M0 scale) | **1** | an integer add on the exponent field |
+
+The three RR4 rows are why carry-free addition costs **3**, and why that 3 does not grow
+with the word: each stage reads only its own column and one neighbour, so all columns
+compute simultaneously. That is [`rr4_add`](@ref)'s `depth` field, and the package
+verifies the value it produces rather than assuming it.
+
+## 2a. What a 3:2 compressor actually is
+
+The whole model pivots on "a 3:2 compressor is one gate level", so it is worth being
+concrete about what the gadget is. It is a **full adder wired differently**.
+
+Three bits of the **same weight** go in; two bits come out — one at that weight, one at
+the weight above. Three rows become two, hence *3:2*:
+
+```
+         a     b     c          three bits, all of weight 2^k
+          \    |    /
+        ┌──┴────┴────┴──┐
+        │  3:2  cell    │       sum   = a ⊕ b ⊕ c        (parity)
+        │  (a full      │       carry = maj(a,b,c)       (majority)
+        │   adder)      │             = ab + bc + ca
+        └───┬───────┬───┘
+            │       │
+        carry       sum
+      weight 2^(k+1)   weight 2^k
+```
+
+Eight cases, all of them:
+
+| a | b | c | sum | carry | check |
+|:-:|:-:|:-:|:---:|:-----:|:---|
+| 0 | 0 | 0 | 0 | 0 | `0 = 0 + 2·0` |
+| 0 | 0 | 1 | 1 | 0 | `1 = 1 + 2·0` |
+| 0 | 1 | 0 | 1 | 0 | `1 = 1 + 2·0` |
+| 0 | 1 | 1 | 0 | 1 | `2 = 0 + 2·1` |
+| 1 | 0 | 0 | 1 | 0 | `1 = 1 + 2·0` |
+| 1 | 0 | 1 | 0 | 1 | `2 = 0 + 2·1` |
+| 1 | 1 | 0 | 0 | 1 | `2 = 0 + 2·1` |
+| 1 | 1 | 1 | 1 | 1 | `3 = 1 + 2·1` |
+
+The identity the whole tree rests on:
+
+```math
+a + b + c \;=\; (a \oplus b \oplus c) \;+\; 2\,\mathrm{maj}(a,b,c)
+```
+
+Three bits sum to a two-bit number whose **low bit is exactly the parity** and whose
+**high bit is exactly the majority**. [`verify_csa_identity`](@ref) checks it on random
+triples, negatives included.
+
+### Why it is one level at any width
+
+Apply it bitwise across whole words. Every column has its own cell, and **no column
+waits for any other**:
+
+```julia
+julia> u, t = csa(93, 118, 45);  u + t
+256
+```
+
+```
+      a =  93   0 0 1 0 1 1 1 0 1
+      b = 118   0 0 1 1 1 0 1 1 0
+      c =  45   0 0 0 1 0 1 1 0 1
+              ───────────────────    every column, simultaneously
+    sum =   6   0 0 0 0 0 0 1 1 0    a ⊕ b ⊕ c, per column
+  carry = 250   0 1 1 1 1 1 0 1 0    maj(a,b,c), shifted left one
+                                     6 + 250 = 256 = 93 + 118 + 45 ✓
+```
+
+**The carry is not propagated — it is written down.** It goes into a second word one
+place to the left, where a *later* tree level will treat it as ordinary input. That is
+the entire trick, and it is why the cell costs one level whether the word is 8 bits or
+800. A ripple adder does the opposite: column `k`'s carry feeds column `k+1`, so the
+delay is `w`.
+
+The price is that the answer is no longer a single number. Three words went in, **two**
+came out, and `sum + carry` is only resolved by an exit carry-propagate adder — paid
+once, at the foot of the tree, rather than once per operand.
+
+### Why 3-to-2, and why rows fall by ⅔
+
+Two bits in would need two out — no compression. Three in, two out is the smallest ratio
+above 1, and it removes exactly one row per cell. So `n` rows in groups of three give
+`⌈2n/3⌉` rows out, which is precisely [`reduction_schedule`](@ref):
+
+```
+ 32 rows → 32 → 22 → 15 → 10 → 7 → 5 → 4 → 3 → 2   (8 levels, 30 cells)
+ 24 rows → 24 → 16 → 11 → 8 → 6 → 4 → 3 → 2        (7 levels, 22 cells)
+ 13 rows → 13 → 9 → 6 → 4 → 3 → 2                  (5 levels, 11 cells)
+```
+
+[`compressor_cells`](@ref) is simply `rows − 2` per bit column: each cell eliminates one
+row, and the reduction stops at two.
+
+### Carry-save is itself a redundant number system
+
+This is the point that decides most comparisons on these pages. Carry-save is
+**redundant radix 2**: each position holds a `(sum, carry)` bit pair, so a digit takes
+values `{0, 1, 2}` — asymmetric, and not a signed-digit system at all.
+
+| | carry-save | RR4 minimal |
+|:---|:---|:---|
+| radix | 2 | 4 |
+| digit set | `{0,1,2}` (a bit pair) | `{-2..2}` |
+| add depth | **1** | 3 |
+| state | **2w** bits (two words) | 1.5w bits |
+| positional? | **no** — a `(sum, carry)` pair is not a number until the exit CPA | **yes** — bounded digits, shiftable, truncatable, indexable |
+
+So when this package says "carry-save beats RR4", it is **not** redundancy losing to
+conventional arithmetic. It is one redundant system beating another on depth, while
+losing to it on state and on being a genuine positional representation. That is the
+trade, and it is why the honest question is always RR4-versus-carry-save rather than
+RR4-versus-binary.
+
+The gadget itself is [`csa`](@ref), its identity is checked by
+[`verify_csa_identity`](@ref), and the trees built from it are
+[`wallace_reduce`](@ref) and [`dadda_reduce`](@ref) — all documented under
+[Redundant systems](@ref).
+
+## 3. Addition
+
+For a `w`-bit addition, [`add_costs`](@ref) charges:
+
+| scheme | depth | derivation |
+|:---|---:|:---|
+| ripple | `w + 1` | the carry threads `w` full adders in series, +1 to resolve the final sum and carry-out |
+| Kogge–Stone prefix | `⌈log₂w⌉` | the prefix network doubles its reach each level, so `⌈log₂w⌉` combine levels |
+| carry-save 3:2 | `1` | one compressor; the result is left redundant as `(sum, carry)` and no carry is resolved |
+| RR4 carry-free | `3` | column sum, transfer, digit — from the table above, at **any** `w` |
+
+```julia
+julia> [(b.method, b.depth) for b in add_costs(64)]
+4-element Vector{Tuple{Symbol, Int64}}:
+ (:ripple, 65)
+ (:prefix, 6)
+ (:carry_save, 1)
+ (:rr4_carry_free, 3)
+```
+
+Carry-save and RR4 both defer work rather than doing it: a carry-save result needs an
+exit carry-propagate adder before it can be compared or stored canonically, and an RR4
+result needs an exit conversion. **Both exits are charged wherever they occur**, which
+is what makes accumulation — where one exit is amortised over `N` terms — the case that
+favours them.
+
+## 4. Reduction trees
+
+Reducing `rows` addends to one sum:
+
+```
+_csa_levels(rows)     from reduction_schedule: rows → ⌈2·rows/3⌉, repeat until 2
+_rr4_tree_depth(rows) = 3 · ⌈log₂ rows⌉
+prefix tree           = ⌈log₂ rows⌉ · ⌈log₂ w⌉
+```
+
+A 3:2 compressor removes one row per cell and costs **one** level per reduction level;
+an RR4 add costs **three** per level. For `K = 32` products that is 8 levels against 15,
+and it is the single fact that decides RR4's fate inside an MXFP4 block:
+
+```julia
+julia> [(r.method, r.levels, r.depth) for r in mxfp4_reduction_options(32)]
+```
+
+| method | levels | depth |
+|:---|---:|---:|
+| carry-save tree | 8 | 12 |
+| RR4 tree | 5 | 19 |
+| prefix tree | 5 | 20 |
+| sequential prefix | 31 | 124 |
+
+`levels` counts reduction *stages*; `depth` is gate delays — `levels` times the cost of
+one stage, plus the exit conversion.
+
+## 5. Multiplication
+
+| quantity | model | note |
+|:---|:---|:---|
+| rows, plain | `n` | one partial product per multiplier bit |
+| rows, Booth radix-4 | `⌈(n+1)/2⌉` | [`booth_rows`](@ref); the `+1` is the unsigned zero-extension |
+| recode | `1` level | Booth only, a local window per digit |
+| tree | `_csa_levels(rows)` | as above |
+| exit CPA | `⌈log₂ 2n⌉` | a prefix adder over the double-width product |
+
+For MXFP4's 4-bit elements [`mxfp4_multiply_options`](@ref) charges a fixed **3**-level
+exit instead, because the product is at most 9 bits wide and `⌈log₂10⌉ = 4` — the
+constant is within one level and keeps the four options comparable.
+
+## 6. Sign detection — the asymmetry that matters
+
+[`sign_detect_depth`](@ref) is the one place the model gives redundancy a *penalty*
+rather than a discount, and it is why soft-max resists it:
+
+| representation | depth | why |
+|:---|---:|:---|
+| two's complement | **0** | the sign **is** the top bit; it is already there |
+| redundant signed-digit | `⌈log₂⌈w/2⌉⌉` | the sign is that of the most significant *non-zero* digit, found by a priority-encode tree over `⌈w/2⌉` digits |
+
+The signed-digit rule is sound because `|Σ_{i<k} dᵢrⁱ| < r^k` — lower digits cannot
+overturn the leading one — but *locating* that digit is a global scan. So a comparison
+costs:
+
+```
+conventional : subtract (prefix, ⌈log₂w⌉) + sign test (0)
+RR4          : subtract (3)               + sign test (⌈log₂⌈w/2⌉⌉)
+```
+
+**Redundancy removes the carry chain from `+` and leaves it in `<`.**
+
+## 7. The MXFP4 kernel budgets
+
+### Dot product — [`mxfp4_dot_costs`](@ref)
+
+Four sequential stages; work *within* a stage is parallel and adds no depth.
+
+| stage | levels | derivation |
+|:---|---:|:---|
+| products | `2` | a 64-entry ROM: E2M1 has 8 magnitudes, so `8×8` entries cover every product |
+| block reduce | `_csa_levels(K) + ⌈log₂(core_bits)⌉` | CSA tree over `K` products, then one exit CPA on the 14-bit core sum |
+| scale | `1` | E8M0 is a power of two, so applying it is an exponent add |
+| cross-block | schedule-dependent | see below |
+
+The cross-block stage is the only one that grows with `N`, and the only one RR4 can
+touch. Three genuinely different datapaths are priced:
+
+```
+tree        canonical  ⌈log₂B⌉ · ⌈log₂w⌉      rr4  3·⌈log₂B⌉ + cpa    cs  _csa_levels(B) + cpa
+sequential  canonical  (B−1) · ⌈log₂w⌉        rr4  3·(B−1) + cpa      cs  (B−1) + cpa
+```
+
+with `B` the block count and `cpa = ⌈log₂w⌉` the single exit conversion.
+
+### Soft-max — [`mxfp4_softmax_costs`](@ref)
+
+| phase | levels | derivation |
+|:---|---:|:---|
+| max | `⌈log₂N⌉ · (subtract + sign test)` | a comparison tree; see §6 for the two costs |
+| exp | `6` | LUT access (2) + one polynomial correction: multiply (≈3) + add (1) |
+| sum | `_csa_levels(N) + ⌈log₂w⌉` conventional, `3⌈log₂N⌉ + ⌈log₂w⌉` RR4 | a reduction tree, §4 |
+| divide | `8 + ⌈log₂w⌉` | reciprocal (LUT + Newton refine) then one multiply |
+
+`exp` and `divide` are **modelled constants**, identical for every datapath. They are
+not derived from anything in this package, and they exist so the Amdahl fraction is
+honest: if you think a hardware `exp` costs 12 levels rather than 6, RR4's addressable
+share falls further.
+
+## 8. A worked example, arithmetic and all
+
+`mxfp4_dot_costs(64)` — 64 elements, `K=32`, so `B = 2` blocks, 32-bit accumulator:
+
+```
+products      2   64-entry LUT
+block reduce 12   _csa_levels(32)=8  +  ⌈log₂14⌉=4
+scale         1   E8M0 exponent add
+cross-block   5   canonical: ⌈log₂2⌉=1 level × ⌈log₂32⌉=5
+                  RR4:       3×1 + 5 = 8
+                  carry-save: _csa_levels(2)=0 + 5 = 5
+─────────────
+total        20   canonical  =  2 + 12 + 1 + 5
+             23   RR4        =  2 + 12 + 1 + 8
+             20   carry-save =  2 + 12 + 1 + 5
+```
+
+`mxfp4_softmax_costs(64)` — `N=64`, `w=16`:
+
+```
+max      24 conv  = ⌈log₂64⌉=6 levels × (⌈log₂16⌉=4 + 0)
+         36 rr4   = 6 × (3 + ⌈log₂8⌉=3)
+exp       6       both
+sum      14 conv  = _csa_levels(64)=10 + 4
+         22 rr4   = 3×6 + 4
+divide   12       = 8 + 4
+─────────────
+total    56 conv  |  76 rr4
+```
+
+## 9. The other two currencies
+
+Depth is one column of three. [`CostBudget`](@ref) reports all of them, and they trade
+against each other — a fact a depth column alone hides.
+
+**Cells** (combinational count):
+
+| scheme | cells |
+|:---|:---|
+| ripple | `w` full adders |
+| Kogge–Stone | `w⌈log₂w⌉ + w` |
+| carry-save | `w` full adders |
+| RR4 | `3` per digit ⇒ `1.5w` |
+| multiplier PP | `rows × n`, Booth's selects charged at **1.3×** a plain AND |
+| multiplier CSA | `(rows − 2) × 2n` |
+| Booth recode | `5` per digit |
+
+**State** (flip-flops held between cycles):
+
+| representation | bits | why |
+|:---|---:|:---|
+| binary radix-4 digit `{0..3}` | 2 | 4 symbols |
+| RR4 `{-2..2}` | **3** | 5 symbols in a 3-bit field, one code wasted |
+| RR4 `{-3..3}` | **3** | 7 symbols |
+| carry-save | **2 per bit** | a sum word and a carry word |
+| multiplier partial products | `rows × 2n` | a tree materialises every row; a sequential shift-add holds one plus the accumulator, `4n` |
+
+So a carry-free accumulator costs **1.5×** a binary register and carry-save **2×**. That
+is [`RR4_BITS_PER_DIGIT`](@ref) against
+[`BINARY_BITS_PER_RADIX4_DIGIT`](@ref), and it is the price of the depth.
+
+The 64-bit adder makes the trade concrete — ripple and prefix compute the *identical*
+sum:
+
+```
+ripple           depth  65 | cells    64 | state   64
+prefix           depth   6 | cells   448 | state   64
+carry_save       depth   1 | cells    64 | state  128
+rr4_carry_free   depth   3 | cells    96 | state   96
+```
+
+Seven times the area for eleven times less depth.
+
+## 10. Cycles — depth divided by a clock
+
+Everything above is **gate levels**. Cycles are a different quantity, and converting
+needs one more parameter: how many levels fit in a cycle. That is `levels_per_cycle`
+(`L`) throughout, defaulting to [`DEFAULT_LEVELS_PER_CYCLE`](@ref) `= 16`.
+
+```
+combinational, pipelined   latency = ⌈D/L⌉ cycles, initiation interval 1
+iterative (one step/cycle) latency = steps · ⌈d_step/L⌉, II the same
+```
+
+[`cycles_for`](@ref) is the whole conversion. The modelling content is in the depth and
+in the choice of `L` — and the choice of `L` matters more than anything else on this
+page.
+
+### The finding that governs the rest
+
+**A depth advantage becomes cycles only when the per-step depth exceeds the cycle
+budget.** Below that it becomes *slack* — clock headroom, or lower power at the same
+clock — not fewer cycles. [`clock_sensitivity`](@ref) makes it unmissable:
+
+```
+  one 64-bit addition, latency in cycles
+  levels/cycle →          4      8     16     32     64      depth
+  ripple                 17      9      5      3      2         65
+  prefix                  2      1      1      1      1          6
+  carry_save              1      1      1      1      1          1
+  rr4_carry_free          1      1      1      1      1          3
+```
+
+At `L = 4` the four schedules differ. By `L = 16` **everything but ripple is one
+cycle** — carry-free's 3-level win over a prefix adder's 6 is real in gate levels and
+worth exactly **zero cycles**. By `L = 64` even ripple has nearly caught up.
+
+### Addition, multiplication, accumulation
+
+At `L = 16`:
+
+| op | method | depth | latency | II | note |
+|:---|:---|---:|---:|---:|:---|
+| add 64b | ripple | 65 | 5 cy | 1 | |
+| | prefix | 6 | **1 cy** | 1 | |
+| | carry-save | 1 | **1 cy** | 1 | |
+| | RR4 | 3 | **1 cy** | 1 | ties prefix |
+| mul 24×24 | shift-add | 144 | 24 cy | 24 | iterative, occupies the unit |
+| | Wallace | 13 | **1 cy** | 1 | pipelined, 1 product/cycle |
+| | Booth-Wallace | 12 | **1 cy** | 1 | Booth's 1-level win = 0 cycles |
+| acc 1024×64b | ripple | — | 5120 cy | — | 5 cycles/term |
+| | prefix | — | **1024 cy** | — | 1 cycle/term |
+| | RR4 | — | 1025 cy | — | 1/term **+ one exit** |
+| | carry-save | — | 1025 cy | — | 1/term + one exit |
+
+Two results worth stating plainly, because both cut against redundancy:
+
+* **Booth's depth saving is zero cycles.** One level out of 13 vanishes at any sane
+  clock. What Booth buys is *area* (0.58× the cells) — and what the tree buys over
+  shift-add is 24× the throughput, which dwarfs both.
+* **In a sequential accumulator, carry-free is one cycle *worse* than a prefix adder.**
+  Both absorb a term per cycle, and RR4 additionally owes the exit conversion. Its
+  20× depth advantage over ripple is real and cashable; its advantage over a prefix
+  adder is not.
+
+### Dot product — latency versus issue
+
+```
+  MXFP4, N=4096, L=16
+  datapath        depth   latency
+  canonical          50      4 cy
+  RR4                41      3 cy
+  carry-save         31      2 cy
+
+  ...but with finite hardware the issue stream dominates:
+  MACs      issue cy  canon tot   RR4 tot
+    64            64         68        67
+   256            16         20        19
+  1024             4          8         7
+  4096             1          5         4
+```
+
+With `N` MACs the whole thing is a 4-cycle pipeline. With 64 MACs it is a 64-cycle
+issue stream with a 4-cycle fill on top, and **the datapath choice moves the total by
+one cycle in sixty-eight**. In a throughput-oriented accelerator depth buys pipeline
+registers, not cycles.
+
+### Soft-max — pass-bound, not gate-bound
+
+```
+  N=4096, L=16, three passes
+  lanes  stream cy  pass bound  fill conv  fill RR4  arith share
+      1       4096       12288          6         9         0.0%
+      8        512        1536          6         9         0.4%
+     32        128         384          6         9         1.5%
+    128         32          96          6         9         5.9%
+```
+
+Soft-max is three streaming passes over `N` — max, then exp-and-sum, then normalise.
+The arithmetic is a **fill cost paid once per pass**, and even at 128 lanes it is under
+6 % of the total. **No adder choice moves soft-max**, which is the honest ceiling on
+what any redundant scheme can do to it.
+
+### Caveats specific to cycles
+
+* Cycle counts are **meaningless without `L`**, which is a budget rather than a
+  measurement. Sweep it.
+* The mapping assumes logic can be **cut cleanly at any level**. Real retiming cannot
+  always place a register where `⌈D/L⌉` wants one, so these are lower bounds on cycles.
+* **Latency and throughput answer different questions.** A pipelined unit with 3-cycle
+  latency and `II = 1` retires one result per cycle; for a long dot product the `II`
+  column decides the runtime.
+* Nothing here models **memory**. For MXFP4 inference the binding constraint is weight
+  bandwidth, which is why the 7.5× compression matters more than any of this.
+
+The functions are [`cycles_for`](@ref), [`add_cycles`](@ref),
+[`multiply_cycles`](@ref), [`accumulate_cycles`](@ref), [`dot_cycles`](@ref),
+[`softmax_cycles`](@ref), [`clock_sensitivity`](@ref) and [`cycle_report`](@ref), with
+[`CycleBudget`](@ref) as the result type — all under [API — Analysis](@ref).
+
+## 11. Pipelining — buying throughput with registers, not with logic
+
+Section 10 divides depth by a clock and gets **latency**. That is only half the story,
+and for a dot product it is the unimportant half.
+
+### The one idea
+
+A pipeline is a chain of combinational blocks with **register banks between them**. The
+logic is not made shallower — the depth is identical — but no *single* cycle has to
+traverse all of it, so the clock can be as short as the deepest stage rather than as long
+as the whole path.
+
+```
+unpipelined:   in ──[ 22 levels of logic ]── out       1 op per 22 levels
+                    └──────── one long cycle ───────┘
+
+pipelined:     in ─[7 lv]─▮─[7 lv]─▮─[8 lv]─ out       1 op per 8 levels
+                          ▲        ▲
+                     register   register
+```
+
+The `▮` are flip-flops. They cost area and a setup/clock-to-q delay, and they buy exactly
+one thing: **the next operand set may enter before the previous one has left.**
+
+Three numbers describe the result, and confusing them is the most common error in this
+whole area:
+
+| term | meaning | for the FP32 multiplier at `L = 8` |
+|:---|:---|---:|
+| **latency** | cycles from input to *its* result | 3 |
+| **II** (initiation interval) | cycles before the unit accepts the next input | 1 |
+| **throughput** | results per cycle, `1/II` | 1.0 |
+
+Latency got *worse* than the unpipelined block in absolute time (three short cycles plus
+three register delays beats one long cycle only marginally). Throughput got 3× better.
+**Pipelining trades a little latency for a lot of throughput**, and is worth it exactly
+when you have many independent operations — which a dot product, a GEMM and a soft-max
+all do, and a dependent scalar recurrence does not.
+
+### The reservation table
+
+`pipeline_timeline` draws which item is in which stage on which cycle. Six FP32
+multiplies through the 3-stage unit:
+
+```julia-repl
+julia> pipeline_timeline(float_multiply_pipeline(FP32; levels_per_cycle = 8), 6)
+```
+
+```
+  cycle           1  2  3  4  5  6  7  8
+  ──────────────────────────────────────
+  S1              A  B  C  D  E  F  .  .   7 lv
+  S2              .  A  B  C  D  E  F  .   7 lv
+  S3              .  .  A  B  C  D  E  F   8 lv
+  retires         .  .  A  B  C  D  E  F
+
+  latency 3 cy · II 1 · 6 items in 8 cy · 2.25× vs unpipelined · 75% utilised
+```
+
+Read it two ways. **Down a column** is what the hardware is doing at one instant: on
+cycle 4, three different multiplies are in flight simultaneously. **Along a row** is one
+item's journey: `A` enters at cycle 1 and retires at cycle 3.
+
+The two triangles of dots are the **fill** and the **drain**. They cost `latency − 1`
+cycles, once, no matter how long the stream is — which is why utilisation climbs from
+75 % at six items to 100 % at a thousand.
+
+### Where the stages actually fall
+
+`pipeline_cut` greedily packs the stages of [`float_multiply_stages`](@ref) into cycles.
+The interesting part is what happens to the 12-level significand multiply, which does not
+fit in an 8-level budget on its own:
+
+```julia-repl
+julia> pipeline_report(float_multiply_pipeline(FP32; levels_per_cycle = 8))
+```
+
+```
+  FP32: depth 22 levels at L = 8
+  stage   levels   slack   contains
+  ────────────────────────────────────────────────────────────────────────
+  S1           7       1   unpack + significand multiply (1/2)
+  S2           7       1   significand multiply (2/2) + normalise
+  S3           8       0   round + post-normalise + pack / specials
+
+  latency 3 cy · II 1 · +116 flip-flops (2 cuts × 58 bits) · 2 levels of slack
+
+  items        cycles    speedup  utilisation
+  ────────────────────────────────────────────
+  1                 3      1.00×          33%
+  4                 6      2.00×          67%
+  16               18      2.67×          89%
+  64               66      2.91×          97%
+  1024           1026      2.99×         100%
+
+  90% of peak speedup needs 19 items.
+```
+
+The register bank is cut **through the middle of the Wallace tree** — `significand
+multiply (1/2)` and `(2/2)`. That is not a modelling convenience; it is what real FP
+multipliers do, because a reduction tree is registerable between any two levels while a
+carry-propagate adder is not. It is also why the pipeline register is 58 bits wide: the
+partial product in flight is a 48-bit carry-save pair plus exponent and flags.
+
+**Slack is the tax.** Two levels of the 24 bought are unused because stages do not
+subdivide to fit. At `L = 16` that tax is far worse:
+
+```
+  FP32: depth 22 levels at L = 16
+  S1          14       2   unpack + significand multiply + normalise
+  S2           8       8   round + post-normalise + pack / specials
+  latency 2 cy · II 1 · +58 flip-flops (1 cut × 58 bits) · 10 levels of slack
+```
+
+Ten of 32 purchased levels are idle — the second stage uses half its cycle. Deep
+pipelines are more *efficient* per level, not just faster.
+
+And at the other extreme the packing itself costs a cycle. `⌈22/4⌉ = 6`, but the greedy
+cut needs **seven** stages at `L = 4`:
+
+```
+  S1           1       3   unpack
+  S2           4       0   significand multiply (1/3)
+  ...
+  latency 7 cy · II 1 · +348 flip-flops (6 cuts × 58 bits) · 6 levels of slack
+```
+
+The 1-level unpack cannot share a cycle with a 4-level slice of the tree, so it burns a
+stage on its own. This is the difference between [`pipeline_plan`](@ref), which cuts a
+homogeneous block wherever it likes and always hits `⌈D/L⌉`, and [`pipeline_cut`](@ref),
+which respects stage boundaries and sometimes cannot. **Real designs live in the second
+case**, and closing that gap is what retiming tools do for a living.
+
+### The speedup law
+
+Against the same logic with no cut registers — which must either run on a clock
+`latency`× slower or be sequenced over `latency` cycles, the same thing in fast-clock
+units:
+
+```math
+\text{speedup}(M) \;=\; \frac{M \cdot \text{latency}}{\text{latency} + (M-1)\cdot \text{II}}
+\;\xrightarrow[M \to \infty]{}\; \frac{\text{latency}}{\text{II}}
+```
+
+Two consequences worth stating plainly:
+
+* **Pipelining never helps a single operation.** At `M = 1` the speedup is exactly 1.00×,
+  as the table shows.
+* **The break-even is proportional to depth.** Reaching 90 % of peak needs
+  `0.9·(latency − 1)/0.1` items: 19 for the 3-stage unit at `L = 8`, 55 for the 7-stage
+  unit at `L = 4`. A GEMM inner loop clears these trivially; a dependent recurrence like
+  a serial accumulator never does — which is precisely the case
+  [`accumulate_cycles`](@ref) models with `:sequential`.
+
+### Why this matters for redundancy
+
+Here is the sharpest consequence for everything in sections 3–8. **A pipelined
+conventional adder and a pipelined carry-free adder both have `II = 1`.** Once the
+pipeline is full they retire one result per cycle each, and RR4's depth advantage shows
+up only in the fill — a one-time cost amortised to nothing over a long stream.
+
+Redundancy's depth win therefore converts into a real throughput win in exactly two
+situations:
+
+1. **The recurrence is dependent** — an accumulator feeding itself cannot be pipelined,
+   because the next add needs this add's result. Here depth *is* the initiation interval,
+   and carry-free's 1-level loop against a prefix adder's `⌈log₂w⌉` is the whole game.
+   This is the case [`accumulate_cycles`](@ref) shows as `:sequential`.
+2. **The clock is aggressive** — at `L = 4` the depth difference crosses a cycle boundary
+   before pipelining can hide it, and you get fewer stages for the same throughput, hence
+   fewer registers and less fill.
+
+For an independent, pipelined, throughput-bound multiply stream, redundancy buys area and
+power, not cycles. Saying otherwise would be the most flattering error available here, so
+it is worth naming.
+
+## 12. How close can a multiply get to one cycle?
+
+The question section 1b leaves open. An FP32 multiply is 22 levels; the default budget is
+16 levels per cycle; so it is two cycles. What can be done about that?
+
+There are exactly two kinds of answer — **make the cycle longer**, or **make the multiply
+shallower** — and only the second one is free.
+
+### Answer 1: relax the clock (and pay for it everywhere)
+
+A 22-level path always fits in a 22-level cycle. In the process-portable unit of
+section 1a that is **44–66 FO4**, against the 15–25 FO4 that high-performance cores
+actually budget:
+
+```julia-repl
+julia> one_cycle_clock(FP32).baseline_cycles_at_core_clock
+(2, 5)
+```
+
+So a single-cycle IEEE FP32 multiplier demands a clock 2–5× slower than the rest of the
+machine. Nothing else in the chip gets faster in exchange. **This is why FP multipliers
+are pipelined rather than made single-cycle** — section 11's trade, taken deliberately.
+
+### Answer 2: the ladder
+
+Each rung removes levels. Each rung also removes something you may have wanted.
+
+```julia-repl
+julia> one_cycle_report(FP32)
+```
+
+```
+  one FP32 × FP32 multiply at L = 16 levels/cycle
+  technique                  depth   saved  cycles  1 cy?  what it costs
+  ────────────────────────────────────────────────────────────────────────────────────
+  IEEE baseline                 22       0       2     no  none — this is the reference
+  + Booth radix-8               21       1       2     no  13→9 rows; one adder for the hard 3× multiple
+  + carry-save product          15       6       1    yes  output is a redundant (48-bit sum, carry) pair, not a number
+  + deferred rounding            8       7       1    yes  needs a wide fused accumulator; rounds once at the end
+    table lookup (N/A)           8       0       1    yes  4611686018427387904 entries exceeds the 4096-entry limit
+```
+
+**Rung 1 → 2, Booth radix-8: 1 level.** Nine partial-product rows instead of thirteen, so
+one fewer Wallace level. It costs a precomputed `3×` multiple — a full carry-propagate
+add before the tree starts, off the critical path but real area. One level for that is a
+poor trade, and it is the same verdict section 5 reaches about radix-4 Booth: **recoding
+buys area, not depth.**
+
+**Rung 2 → 3, carry-save product: 6 levels.** Delete the exit carry-propagate adder. The
+Wallace tree already has the answer as a redundant `(sum, carry)` pair; the CPA exists
+only to turn it into a binary number. If the consumer is another adder tree, it does not
+want a binary number.
+
+```
+  conventional:  [Wallace tree] ─▶ [ CPA, 6 levels ] ─▶ binary product ─▶ accumulator
+  carry-save:    [Wallace tree] ─────────────────────▶ (sum, carry) ────▶ accumulator
+                                                          two words,        which is
+                                                       no carry chain     a CSA anyway
+```
+
+This is the single largest saving available, and it is the same observation as section 4:
+**a reduction tree has no use for resolved carries until the very end.** Note what it is
+not — it is not RR4. Carry-save *is* a redundant representation, just the cheapest one.
+
+**Rung 3 → 4, deferred rounding: 7 levels.** Do not round, normalise or post-normalise
+the product at all. Feed the full-width unrounded product into a wide accumulator and
+round exactly once, when the dot product finishes. Section 1b measured rounding at 5 of
+FP32's 22 levels, and this removes all of it plus both normalisation shifts.
+
+The remarkable part: this is **more accurate, not less.** Per-product rounding injects `N`
+roundings into a length-`N` dot product; a fused wide accumulator injects one. It is the
+same argument that makes exact block sums attractive in section 7. Rounding is a third of
+an FP multiplier, it costs accuracy, and for a MAC you do not need it.
+
+After rungs 3 and 4, FP32 is **8 levels — comfortably single-cycle at `L = 16`, and
+single-cycle even at `L = 8`.** But notice what the surviving unit produces: an unrounded,
+unnormalised, redundant, 48-bit intermediate. It is not an FP32 number and cannot be
+written to a register file. **It is a MAC array's internal wire, and that is the honest
+answer to "can a multiply be single-cycle": yes, if its result is allowed not to be a
+float.**
+
+**Rung 5, table lookup.** For a narrow format the entire multiplier is a ROM. FP32's
+table would need 2⁶² entries, so it is unavailable — but this is exactly the rung MXFP4
+lives on.
+
+### Answer 3: narrow the format — which beats every trick above
+
+```julia-repl
+julia> one_cycle_formats()
+```
+
+```
+  format      sig  IEEE lv   IEEE cy  best lv    best cy     LUT?
+  ──────────────────────────────────────────────────────────────────
+  E2M1          2        9         1        2          1      yes
+  E4M3          4       12         1        4          1       no
+  FP16         11       18         2        6          1       no
+  BF16          8       16         1        5          1       no
+  FP32         24       22         2        8          1       no
+  FP64         53       26         2       10          1       no
+```
+
+**E2M1 is 9 levels as a plain IEEE multiplier — single-cycle already, at the default
+clock, with no tricks at all.** Push it onto the LUT rung and it is 2 levels: an E2M1
+significand is one bit, so the significand "product" is a three-way choice between 1.00,
+1.50 and 2.25, and the whole magnitude multiply is a **64-entry ROM over 8×8 magnitudes**
+with the sign as one XOR. Two levels is single-cycle at *any* clock a person would build,
+including the 4-levels-per-cycle budget where nothing else survives.
+
+Compare the columns. Every microarchitectural technique in the ladder together takes FP32
+from 22 levels to 8 — a 2.75× depth reduction, at the cost of a non-standard result.
+Changing the format takes it from 22 to 2 — an 11× reduction — and it composes with the
+7.5× memory saving on top.
+
+**That is the MXFP4 case restated in cycles: the format change is worth more than the
+entire arithmetic toolbox, and it is the reason this package spends most of its effort on
+quantisation error rather than on adders.** It is also, uncomfortably, the reason
+redundancy has so little to sell at 4 bits — a point section 7 makes from the other
+direction and [`mxfp4_multiply_options`](@ref) prices directly.
+
+### Caveats specific to this section
+
+* The LUT rung's **depth 2** assumes a small table synthesised as two-level AND–OR logic.
+  A 64-entry table is comfortably in that regime; a 4096-entry one is at the edge and
+  would more likely be a mux tree of `log₂` depth. The `lut_limit` keyword controls where
+  the model stops believing itself.
+* Rungs 3 and 4 **change the interface**, not just the implementation. Comparing their
+  depth against a rung-1 IEEE multiplier is only fair inside a MAC array where the
+  redundant, unrounded intermediate is consumed directly. In a general-purpose FPU it is
+  not an option at all.
+* Booth radix-8's saving of one level is within the noise of the reduction-schedule model
+  (section 4). Do not read it as precise; read it as "roughly nothing".
+
+The functions are [`pipeline_plan`](@ref), [`pipeline_cut`](@ref),
+[`float_multiply_pipeline`](@ref), [`pipeline_time`](@ref), [`pipeline_speedup`](@ref),
+[`pipeline_utilization`](@ref), [`pipeline_breakeven`](@ref),
+[`pipeline_timeline`](@ref), [`pipeline_report`](@ref), [`one_cycle_multiply`](@ref),
+[`one_cycle_clock`](@ref), [`one_cycle_report`](@ref) and [`one_cycle_formats`](@ref),
+with [`Pipe`](@ref), [`PipeStage`](@ref) and [`MulRung`](@ref) as the result types — all
+under [API — Analysis](@ref).
+
+## 13. The software mirror: an external C++ benchmark, measured
+
+Everything above is a model. This section is a **measurement**, from an external
+benchmark (`rr4_fp32_bench.cpp`) run on an Apple M2 Max, and it is included because it
+tests the same claims from the opposite side — software instead of silicon — and one of
+them comes back inverted.
+
+The benchmark does two things: it implements a software IEEE-754 binary32 adder and
+checks it against the hardware `fadd`, and it times four accumulation schedules over
+`N = 2²⁰` floats.
+
+```console
+$ g++ -O2 -std=c++20 rr4_fp32_bench.cpp -o bench && ./bench
+```
+
+!!! note "One-line portability fix"
+    The timing barrier uses `asm volatile(""::"x"(sink):"memory")`. The `"x"` constraint
+    is an x86 SSE register class; on AArch64 the equivalent is `"w"`, and without the
+    swap the file does not compile (`couldn't allocate input reg for constraint 'x'`).
+    `-march=native` is also rejected by Apple clang on arm64. The numbers below are from
+    a copy with that one constraint changed and nothing else.
+
+### 13a. The software adder is exact on the path it claims, and 17× too slow
+
+`soft_add` is a branch-light normal-path adder: 24-bit significands with **3 guard bits**
+and the sticky bit kept as a **separate flag** rather than folded into the low bits, which
+is what lets the subtraction path stay exact (`m = ma - mb - S`). The cancellation path
+then re-injects the residue as `m |= 1 << (lz-1)`.
+
+It works. Sweeping every exponent difference from 0 to 32, 200 000 random pairs each —
+**6.6 million pairs, zero mismatches**, including the two places this kind of code
+normally breaks:
+
+```
+  sh=0 :0    sh=1 :0    sh=2 :0   ...  sh=23:0  sh=24:0  sh=25:0  ...  sh=32:0
+  worst exponent difference: none — 0 mismatches at every shift
+```
+
+`sh = 0` is maximum cancellation and `sh ≈ 24–27` is the sticky boundary where the
+smaller operand falls off the guard grid. Both are clean. That is a well-built adder.
+
+**But the scope limits bite harder than the header comment admits.** The file says
+"normal path only (no NaN/Inf/subnormal handling)". Measured case by case:
+
+| case | hardware | `soft_add` | |
+|:---|:---|:---|:---|
+| `(+0) + (+0)` | `0x00000000` | `0x00800000` = 1.175e-38 | **mismatch** |
+| `(-0) + (-0)` | `0x80000000` | `0x80800000` | **mismatch** |
+| `(+0) + (-0)` | `0x00000000` | `0x00000000` | ok |
+| `1 + (-1)` | `0` | `0` | ok |
+| `Inf + 1` | `Inf` | `Inf` | ok |
+| `Inf + (-Inf)` | `NaN` | `0` | **mismatch** |
+| `NaN + 1` | `NaN` | `NaN` | ok |
+| `1 + 2⁻¹⁴⁹` | `1` | `1` | ok |
+| subnormal + subnormal | `1.076e-42` | `1.176e-38` | **mismatch** |
+| overflow | `Inf` | `0x7ff33333` = NaN | **mismatch** |
+
+Two of these are worth naming because they are not what "no special handling" suggests.
+**Zero plus zero returns `FLT_MIN`, not zero** — the implicit leading 1 is OR'd in
+unconditionally (`(a&0x7fffff)|0x800000`), so a zero operand enters the datapath as
+`1.0 × 2⁻¹²⁶` and the `if (m==0 && S==0)` guard never fires. Opposite-signed zeros happen
+to cancel back to zero, which is why a random signed-zero probe mismatches on about half
+its cases rather than all of them. And **overflow yields a NaN rather than an Infinity**,
+because the exponent walks into the NaN encoding. Both are silent-corruption modes rather
+than graceful ones; neither is on the tested path, and neither is hard to fix.
+
+The cost, on a dependent chain so the comparison is like for like:
+
+```
+  serial fadd chain :   0.882 ns/elem     (hardware)
+  software adder    :  15.540 ns/elem     (17x slower)
+```
+
+**That 17× is the most useful number in the file for this document.** §1b prices an FP32
+multiply at 22 gate levels and an add at rather fewer, and it is easy to read those as
+"not much". They are one machine instruction. Rebuilding an FP add out of the ISA's own
+integer primitives takes about **seventeen** of them. The gate-level budgets are small
+precisely because they are *hardware*.
+
+### 13b. Three accumulation schedules, timed and — the part the benchmark omits — measured for error
+
+The benchmark times three schedules but prints no accuracy at all, which leaves its most
+interesting result invisible. Timings on an M2 Max (3 runs, ±5 %):
+
+| schedule | ns/elem | vs serial | what it is |
+|:---|---:|---:|:---|
+| `sum_serial` | 0.882 | 1.0× | one dependency chain |
+| `sum_lanes8` | 0.111 | **8.0× faster** | 8 independent accumulators |
+| `sum_twosum` | 3.461 | **3.9× slower** | two-limb redundant `(s, e)` |
+
+At 3.68 GHz, `sum_serial`'s 0.88 ns is **3.2 cycles per element** — one FP-add latency,
+which is the definition of latency-bound. `sum_twosum`'s inner loop is a four-instruction
+dependency chain (`fadd`, `fadd`, `fsub`, `fadd`), and 3.46 / 0.88 ≈ 3.9 is exactly that
+chain-length ratio. The model in §11 predicts both.
+
+Adding the accuracy column against a `long double` reference:
+
+```
+  accumulation error in ulps of the true sum (N = 2^20)
+  dataset                            serial       lanes8       twosum
+  gaussian(0,1)                       110.3         23.3          0.7
+  all-positive                       1748.8         66.8          0.2
+  harmonic 1/i                      38248.0        928.0          0.0
+  1e8 then 1.0 x N (stagnates)     131071.9      16383.9          0.1
+```
+
+**The 8-lane schedule is simultaneously 8× faster and 5–41× more accurate than the serial
+one.** That is not a trade-off; it is a free win, and it is the same reason a reduction
+tree beats a ripple chain in §4 — breaking the chain shortens both the critical path
+*and* the error accumulation, because each of the eight partial sums stays smaller and so
+absorbs less.
+
+The stagnation row is the vivid one:
+
+```
+  true = 101048575.0    serial = 100000000.0    lanes8 = 100917504.0    twosum = 101048576.0
+```
+
+`ulp(10⁸)` is 8, so in the serial chain **every one of the 2²⁰ subsequent `1.0`s vanishes
+entirely** and the sum never moves off its initial value. Eight lanes recover most of it;
+the redundant two-limb form gets it right to 1 ulp.
+
+### 13c. Where the mirror inverts: redundancy is free in hardware and expensive in software
+
+`sum_twosum` is a **software carry-save**. The value lives redundantly in two limbs,
+`s + e`, no single `fadd` ever has to be the whole answer, and resolution is deferred to
+one final `s + e` at the exit. That is line-for-line the argument of §4 ("a reduction tree
+has no use for resolved carries until the exit") and of §12's carry-save rung.
+
+And in software it **costs 3.9×**, where in hardware the same idea *saves* 6 of 22 levels.
+
+The reason is worth stating precisely, because it is the sharpest limit on how far the
+hardware conclusions in this document travel:
+
+> A hardware designer can choose not to build the carry-propagate adder. A software author
+> cannot choose not to execute it. Every `fadd` resolves — normalise, round, pack — because
+> that is the only add the ISA sells. So keeping a value redundant in software means
+> *emulating* the redundancy on top of a fully-resolved primitive: four instructions where
+> one would do.
+
+Redundancy in hardware buys **depth** and costs area. Redundancy in software buys
+**accuracy** and costs time. They are not the same trade, and a result from either side
+does not transfer to the other. The benchmark's own framing — that `sum_twosum` is "the
+place the RR4 lessons actually pay in software" — is right about the *lesson* (defer
+resolution) and, on these measurements, inverted about the *payoff*: it pays in exactness,
+not in speed.
+
+### Caveats specific to this section
+
+* One machine, one compiler, one `-O2`. The ratios are stable across runs to about ±5 %,
+  but they are not portable claims.
+* `sum_lanes8`'s 8× is **ILP and SIMD together, not ILP alone.** The disassembly shows
+  `ld4.2s` feeding four `fadd.2s` — four accumulators × two SIMD lanes. The benchmark
+  labels this "the tree schedule in software", which understates what the compiler did:
+  a scalar 8-accumulator version would not reach 8×.
+* The ulp figures are data-dependent. The gaussian row moved between 5× and 19×
+  serial-to-lanes8 across seeds; the harmonic and stagnation rows are stable and
+  dramatic, because they are constructed to be.
+* `soft_add`'s 17× is against a *dependent* hardware chain, which is the fair comparison
+  (both are serial). Against `sum_lanes8` it would be ~140×, but that would be comparing
+  a scalar chain to a vectorised one.
+
+## Known simplifications
+
+Stated with their **direction**, because a bias that flatters the conclusion is worth
+more scrutiny than one that fights it.
+
+**Pre- and post-processing folded into the prefix count.** A strict Kogge–Stone is
+`⌈log₂w⌉ + 2`: one level to form `(g,p)` and one for the final sum XOR. This package
+charges `⌈log₂w⌉`. RR4's 3 is a *complete* count, so this simplification **understates
+canonical depth and therefore flatters the conventional schemes** — it works against
+RR4, not for it. Every "RR4 loses" conclusion on these pages survives the correction;
+one sub-claim moves:
+
+All rows below are recomputed on the **same basis** — full pipeline totals for the
+`N = 4096`, 64-bit sequential accumulator, and depths for the `K = 32` block reduction:
+
+| claim | as modelled | with prefix +2 | survives? |
+|:---|:---|:---|:---|
+| carry-save beats RR4 for block reduction | 12 vs 19 | 14 vs 21 | **yes** |
+| ...and beats a prefix tree by more | 12 vs 20 | 14 vs 30 | **yes, larger** |
+| RR4 beats canonical, wide sequential accumulator | 777 vs 402, **1.93×** | 1033 vs 406, **2.54×** | **yes, larger** |
+| carry-save beats RR4 there | 148 vs 402, **0.37×** | 152 vs 406, **0.37×** | **yes, unchanged** |
+| RR4 loses the soft-max max phase | 24 vs 36 | 36 vs 36 | **weakens to a tie** |
+
+The soft-max prose already says the subtract and the sign test "cancel", which is the
+corrected reading; the table shows the folded-convention numbers.
+
+**Other coarsenings**
+
+* **Wire delay is ignored.** This is Kogge–Stone's real cost — `Θ(n log n)` combine
+  edges with long spans — and omitting it flatters the prefix adder further.
+* **`exp` and reciprocal are constants** (6 and 8), not derived. They are identical
+  across datapaths, so they affect Amdahl fractions but no ratio between schemes.
+* **The MXFP4 multiplier exit is a flat 3** rather than `⌈log₂ 2n⌉ = 4`, within one
+  level at this width.
+* **Booth selects are charged 1.3×** a plain AND, a guess chosen to avoid flattering
+  Booth on cells.
+* **No pipelining, no clock, no area-vs-delay curve.** Depth is reported; whether you
+  can pipeline it away is not modelled.
+
+## What it is calibrated against
+
+The model reproduces, rather than assumes:
+
+* Booth radix-4 halves the partial-product rows — exactly, at every width
+  ([`booth_tree_saving`](@ref), verified in the test suite from 8 to 64 bits).
+* Carry-free addition is depth 3 at every width, and carry-save depth 1.
+* `2^k − 1` needs `k` adders in binary and **1** in CSD
+  ([`constant_multiply_costs`](@ref)).
+* The MXFP4 operand widths are **derived from the format**, not assumed:
+  [`mxfp4_widths`](@ref) reads E2M1's grid, doubles it to integers, and computes the
+  product and core-sum bounds from there.
+
+And one thing it is checked against from outside itself: §13 measures an external C++
+benchmark on real silicon. Two of the model's predictions survive that contact — a serial
+accumulate is latency-bound at exactly one FP-add latency per element, and a four-op
+dependency chain costs four times a one-op chain — and one **inverts**: deferring
+resolution saves depth in hardware and costs time in software. That inversion is the
+clearest boundary on how far anything on this page travels.
+
+Everything on this page is pinned by the test suite, so the prose cannot drift from the
+code without a test going red. §13 is the exception: those are measurements from an
+external program, reproduced here rather than recomputed, and they will differ on your
+machine.
+
+See [Examples](@ref) for the model applied end to end, and
+[API — Analysis](@ref) for the signatures.

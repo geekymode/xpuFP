@@ -1,0 +1,4 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+xpuFP = "ad6771ad-d83c-4aac-9aff-594fe717e7b5"
