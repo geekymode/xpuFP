@@ -7,11 +7,12 @@ makedocs(
     sitename = "xpuFP.jl",
     authors  = "rethna",
     modules  = [xpuFP],
-    remotes  = nothing,   # not a git repo yet; disables source links
     format   = Documenter.HTML(
-        prettyurls = get(ENV, "CI", "false") == "true",
-        assets     = String[],
+        prettyurls   = get(ENV, "CI", "false") == "true",
+        canonical    = "https://geekymode.github.io/xpuFP",
+        assets       = String[],
         sidebar_sitename = true,
+        edit_link    = "main",
     ),
     pages = [
         "Home"           => "index.md",
@@ -38,4 +39,10 @@ makedocs(
     ],
     doctest  = false,   # enabled once every docstring example is finalised
     warnonly = true,
+)
+
+deploydocs(
+    repo         = "github.com/geekymode/xpuFP.git",
+    devbranch    = "main",
+    push_preview = false,
 )
