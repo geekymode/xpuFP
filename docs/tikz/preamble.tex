@@ -1,0 +1,28 @@
+\usepackage{tikz}
+\usepackage{amsmath}
+\usetikzlibrary{positioning,arrows.meta,calc,fit,backgrounds,shapes.geometric,decorations.pathreplacing}
+\definecolor{inkc}{HTML}{171A22}
+\definecolor{mutedc}{HTML}{5B6274}
+\definecolor{hairc}{HTML}{C9CEDA}
+\definecolor{surfc}{HTML}{F2F4F8}
+\definecolor{scalec}{HTML}{2E45A8}   % blue  = scale path
+\definecolor{elemc}{HTML}{A65A18}    % ochre = element path
+\definecolor{costc}{HTML}{B3261E}    % red   = the expensive operator
+\definecolor{freec}{HTML}{1E6F4C}    % green = free / shift-only
+% text macro for the small monospace annotations inside nodes
+\newcommand{\dt}[1]{{\tiny\ttfamily\textcolor{mutedc}{#1}}}
+\tikzset{
+  blk/.style   ={draw=inkc,line width=.6pt,rounded corners=1.5pt,fill=white,
+                 inner sep=4pt,align=center,font=\scriptsize},
+  op/.style    ={blk,fill=surfc},
+  mul/.style   ={blk,draw=costc,line width=1pt,fill=costc!7,text=costc},
+  free/.style  ={blk,draw=freec,fill=freec!7,text=freec},
+  scaleb/.style={blk,draw=scalec,fill=scalec!7,text=scalec},
+  elemb/.style ={blk,draw=elemc,fill=elemc!7,text=elemc},
+  dat/.style   ={font=\scriptsize\ttfamily,text=mutedc},
+  lbl/.style   ={font=\scriptsize,text=mutedc,align=center},
+  ttl/.style   ={font=\small\bfseries,text=inkc},
+  ar/.style    ={-{Stealth[length=4pt,width=3pt]},draw=inkc,line width=.5pt},
+  arS/.style   ={ar,draw=scalec},
+  arE/.style   ={ar,draw=elemc},
+}

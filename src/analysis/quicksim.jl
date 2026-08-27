@@ -177,6 +177,16 @@ end
     s
 end
 
+# absolute error of a block under a trial scale — BO2_BRACKET's metric
+@inline function _sae(k::BlockKernel, blk, S::Float64)
+    S <= 0 && return Inf
+    s = 0.0
+    @inbounds for j in eachindex(blk)
+        s += abs(lut_quantize(k.elem, blk[j] / S) * S - blk[j])
+    end
+    s
+end
+
 # the block scale, matching `block_scale` rule for rule (including its range guard)
 function _scale(k::BlockKernel, blk, M::Float64)
     M == 0 && return 1.0
@@ -191,6 +201,18 @@ function _scale(k::BlockKernel, blk, M::Float64)
         e = binade_exponent(M) - k.emax
         a, b = exp2(e), exp2(e + 1)
         _sse(k, blk, a) <= _sse(k, blk, b) ? a : b
+    elseif r == BO2_BRACKET
+        # ceil(M/emax) on the scale grid, then BO2_NCAND-1 steps down, chosen on L1.
+        # Mirrors `_bo2_bracket_scale` including its first-strict-minimum tie-break.
+        c = _scale_grid_ceil(k.fmt.scale, M / k.maxel)
+        best, bestS = Inf, c
+        for _ in 1:BO2_NCAND
+            (c <= 0 || !isfinite(c)) && break
+            e = _sae(k, blk, c)
+            e < best && (best = e; bestS = c)
+            c = _scale_grid_down(k.fmt.scale, c)
+        end
+        bestS
     else  # MSE_OPTIMAL
         # The 1.5-octave search window is scanned at `npts` points, but the scale format
         # is *discrete*: E4M3 offers eight steps per binade, so those 200 trial exponents
@@ -255,6 +277,10 @@ struct QuickSNR
     clipped::Float64
     blocks::Int
     seconds::Float64
+    qsnr_median::Float64
+    qsnr_p10::Float64
+    qsnr_min::Float64
+    qsnr_gap::Float64
 end
 
 """
@@ -341,6 +367,8 @@ function quick_snr(bf::BlockFormat, x::AbstractVector; dataset::AbstractString =
     sig = 0.0; noi = 0.0
     nz = 0; zeroed = 0; clipped = 0; nblk = 0
     blk = Vector{Float64}(undef, K)
+    bq = Float64[]                       # per-block QSNR, the distribution behind `snr`
+    sizehint!(bq, cld(n, K))
 
     @inbounds for i in 1:K:n
         j = min(i + K - 1, n)
@@ -354,27 +382,39 @@ function quick_snr(bf::BlockFormat, x::AbstractVector; dataset::AbstractString =
         end
         S = _scale(k, view(blk, 1:len), M)
         top = k.elem.maxpos * S
+        bsig = 0.0; bnoi = 0.0
         for t in 1:len
             v = blk[t]
             q = lut_quantize(k.elem, v / S) * S
             xt = v * sg                       # back in the original units for the ratio
             d = q * sg - xt
-            sig += xt * xt
-            noi += d * d
+            bsig += xt * xt
+            bnoi += d * d
             if v != 0
                 nz += 1
                 q == 0 && (zeroed += 1)
                 abs(v) > top && (clipped += 1)
             end
         end
+        sig += bsig; noi += bnoi
+        # an all-zero block was empty, not damaged — skip it rather than score it 0 dB
+        bsig > 0 && push!(bq, bnoi == 0 ? Inf : 10 * log10(bsig / bnoi))
         nblk += 1
     end
 
     snr = sig == 0 ? 0.0 : noi == 0 ? Inf : 10 * log10(sig / noi)
     b = bits_per_element(bf)
+    fin = filter(isfinite, bq)
+    if isempty(fin)
+        qmed = qp10 = qmin = Inf; qgap = 0.0
+    else
+        sort!(fin)
+        pick(p) = fin[clamp(ceil(Int, p * length(fin)), 1, length(fin))]
+        qmed = pick(0.50); qp10 = pick(0.10); qmin = fin[1]; qgap = snr - qp10
+    end
     QuickSNR(bf.name, String(dataset), n, K, snr, effective_bits(snr), b, snr / b,
              dot_snr_law(snr), nz == 0 ? 0.0 : zeroed / nz, nz == 0 ? 0.0 : clipped / nz,
-             nblk, time() - t0)
+             nblk, time() - t0, qmed, qp10, qmin, qgap)
 end
 
 function quick_snr(bf::BlockFormat; n::Integer = 1_000_000, dist::Symbol = :gaussian,
@@ -386,7 +426,10 @@ end
 function Base.show(io::IO, ::MIME"text/plain", q::QuickSNR)
     println(io, q.scheme, " on ", q.dataset, " — ", q.n, " values in ", q.blocks,
             " blocks of ", q.K)
-    @printf(io, "  SNR          : %7.3f dB   (%.2f effective bits)\n", q.snr, q.eff_bits)
+    @printf(io, "  SNR (pooled) : %7.3f dB   (%.2f effective bits)\n", q.snr, q.eff_bits)
+    @printf(io, "  QSNR / block : median %.3f, p10 %.3f, min %.3f dB\n",
+            q.qsnr_median, q.qsnr_p10, q.qsnr_min)
+    @printf(io, "  gap          : %+7.3f dB   (pooled − p10)\n", q.qsnr_gap)
     @printf(io, "  storage      : %7.3f bits/value   →  %.2f dB per bit\n",
             q.bits, q.db_per_bit)
     @printf(io, "  dot product  : %7.3f dB   (element SNR − 3.01)\n", q.dot_snr)
@@ -454,14 +497,17 @@ function quick_compare(formats; n::Integer = 1_000_000, dist::Symbol = :gaussian
                        seed::Integer = 0, io::IO = stdout, npts::Integer = 200)
     x = quick_data(dist, n; rng = MersenneTwister(seed))
     rows = [quick_snr(bf, x; dataset = String(dist), npts = npts) for bf in formats]
-    @printf(io, "%-28s %5s %9s %9s %7s %8s %6s %5s\n",
-            "scheme", "bits", "SNR dB", "eff bits", "dB/bit", "zeroed%", "clip%", "s")
-    println(io, "─"^84)
+    @printf(io, "%-28s %5s %9s %9s %8s %7s %7s %8s %6s\n",
+            "scheme", "bits", "SNR dB", "QSNR p10", "QSNR min", "gap", "dB/bit",
+            "zeroed%", "clip%")
+    println(io, "─"^96)
     for r in rows
-        @printf(io, "%-28s %5.2f %9.3f %9.2f %7.2f %8.2f %6.2f %5.2f\n",
-                r.scheme, r.bits, r.snr, r.eff_bits, r.db_per_bit,
-                100 * r.zeroed, 100 * r.clipped, r.seconds)
+        @printf(io, "%-28s %5.2f %9.3f %9.3f %8.3f %+7.3f %7.2f %8.2f %6.2f\n",
+                r.scheme, r.bits, r.snr, r.qsnr_p10, r.qsnr_min, r.qsnr_gap,
+                r.db_per_bit, 100 * r.zeroed, 100 * r.clipped)
     end
+    println(io, "\nSNR dB is pooled (energy-weighted, the usual published QSNR).")
+    println(io, "QSNR p10/min are per-block, every block weighted equally; gap = pooled − p10.")
     rows
 end
 

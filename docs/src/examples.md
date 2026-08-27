@@ -278,18 +278,21 @@ the format, not in the luck of two independent samples.
 ==================================================================================
   1. THE SHIPPED FORMATS, plus what modifying them buys
 ==================================================================================
-scheme                        bits    SNR dB  eff bits  dB/bit  zeroed%  clip%     s
-────────────────────────────────────────────────────────────────────────────────────
-MXFP4                         4.25    18.790      3.12    4.42     8.78   2.34  0.01
-NVFP4                         4.50    20.440      3.40    4.54     6.78   3.47  0.01
-FP4-K32-E8M0-OPT_SHIFT        4.25    19.043      3.16    4.48     9.48   0.91  0.01
-FP4-K32-E8M0-BEST_POW2        4.25    19.047      3.16    4.48     9.50   0.82  0.03
-FP4-K16-E8M0-MX_FLOOR_POW2    4.50    18.582      3.09    4.13     7.46   4.71  0.01
-FP4-K16-E4M3-MSE_OPTIMAL      4.50    21.588      3.59    4.80     7.31   3.35  0.84
-MXINT4                        4.25    17.575      2.92    4.14    17.41   0.86  0.02
+scheme                        bits    SNR dB  QSNR p10 QSNR min     gap  dB/bit  zeroed%  clip%
+────────────────────────────────────────────────────────────────────────────────────────────────
+MXFP4                         4.25    18.790    17.275   14.281  +1.515    4.42     8.78   2.34
+NVFP4                         4.50    20.440    18.666   16.193  +1.774    4.54     6.78   3.47
+FP4-K32-E8M0-OPT_SHIFT        4.25    19.043    17.709   14.516  +1.334    4.48     9.48   0.91
+FP4-K32-E8M0-BEST_POW2        4.25    19.047    17.715   14.516  +1.332    4.48     9.50   0.82
+FP4-K16-E8M0-MX_FLOOR_POW2    4.50    18.582    16.536   13.203  +2.046    4.13     7.46   4.71
+FP4-K16-E4M3-MSE_OPTIMAL      4.50    21.588    20.290   18.862  +1.298    4.80     7.31   3.35
+MXINT4                        4.25    17.575    15.702   10.279  +1.874    4.14    17.41   0.86
+
+SNR dB is pooled (energy-weighted, the usual published QSNR).
+QSNR p10/min are per-block, every block weighted equally; gap = pooled − p10.
 ```
 
-Three readings worth having:
+Five readings worth having — the last two only visible once QSNR is in the table:
 
 * The **optimized shift rule** buys +0.25 dB over MXFP4 for *one comparison against a
   constant* in the encoder — and lands within 0.004 dB of `BEST_POW2`, which pays a
@@ -300,6 +303,17 @@ Three readings worth having:
   comes from its shorter block. It is all the E4M3 scale format.
 * `MXINT4` zeroes 17.4 % of its inputs against MXFP4's 8.8 %. The uniform grid spends
   its levels on the Gaussian's thin tails and starves the bulk.
+* **`MXINT4`'s tail is far worse than its headline admits.** Its pooled SNR is 1.2 dB
+  below MXFP4's, but its *worst block* is **10.28 dB against MXFP4's 14.28** — a 4 dB
+  deficit that the energy-weighted column compresses to one. If a downstream layer is
+  sensitive to its weakest block rather than its average one, that is the number that
+  decides, and pooled SNR does not show it.
+* **`FP4-K16-E4M3-MSE_OPTIMAL` wins on every column, including the `gap`.** It has both
+  the highest floor (18.86 dB minimum block) and the *smallest* spread between headline
+  and tenth percentile (+1.30 dB). It is not merely better on average — it is more
+  uniformly good, which is a different and more useful property. Compare
+  `FP4-K16-E8M0-MX_FLOOR_POW2`, whose +2.05 dB gap is the largest in the table: its
+  headline flatters it most.
 
 The `clip%` column is not zero for any rule, which is why it is printed:
 `MX_FLOOR_POW2` only promises ``M/S ∈ [4,8)`` against a grid that stops at 6, and

@@ -26,6 +26,69 @@ cosine_similarity
 cosine_from_snr
 ```
 
+## QSNR: the same ratio, told block by block
+
+The quantization literature writes **QSNR** for
+
+```math
+\mathrm{QSNR} = 10\log_{10}\frac{\sum_i x_i^2}{\sum_i (x_i - q(x_i))^2}
+```
+
+which is [`measure_snr`](@ref) exactly — same formula, same number, to the last decimal.
+Worth saying plainly rather than shipping a second function that returns the first one's
+answer.
+
+What the published figure hides is the **aggregation**. That sum runs over the whole
+tensor, so each block contributes in proportion to its energy: a high-energy block can
+carry the score while a low-energy block is quietly ruined. It is the failure mode
+[`snr_db`](@ref)'s own warning describes, and on block-scaled formats it is not
+hypothetical, because each block gets its own scale and therefore its own fate.
+
+[`measure_qsnr`](@ref) computes the ratio *within* each block of `K` and reports the
+distribution, so every block counts equally:
+
+```julia
+julia> using Random
+
+julia> x = quick_data(:sparse, 200_000; rng = MersenneTwister(0));
+
+julia> q = measure_qsnr(MXFP4, x);
+
+julia> round.((q.pooled, q.median, q.p10, q.min), digits = 2)
+(18.16, 18.95, 14.81, 12.03)
+```
+
+Pooled says 18.16 dB. The tenth-percentile block says 14.81, and the worst says 12.03 —
+a **`gap` of +3.34 dB** between the headline and the tail on the same data.
+
+Two rules follow:
+
+* **Pooled QSNR answers "how much signal energy survived".** It is the right number for
+  comparing formats at a glance, and it is what to quote against published results.
+* **Per-block QSNR answers "is there a block I ruined".** It is the right number for
+  deciding whether a format is safe to deploy, because a downstream layer sees blocks,
+  not tensors.
+
+The two agree to a tenth of a dB on Gaussian data and diverge by whole decibels the
+moment the data is sparse or heavy-tailed — precisely when the question matters. The
+`gap` field makes that divergence a number you can sort on.
+
+!!! note "An empty block is not a damaged one"
+    [`snr_db`](@ref) returns `0.0` when the signal itself is zero. Scoring an all-zero
+    block as "0 dB" would report absent data as total destruction, so
+    [`qsnr_blocks`](@ref) skips zero-energy blocks rather than counting them. The
+    `dead_blocks` field counts only blocks that had energy and lost it.
+
+The result type is [`QSNR`](@ref) — documented on the API page, since
+[API — Analysis](@ref) already autodocs this file and listing the type twice would
+collide.
+
+```@docs
+qsnr
+qsnr_blocks
+measure_qsnr
+```
+
 ## Coding efficiency
 
 ```@docs

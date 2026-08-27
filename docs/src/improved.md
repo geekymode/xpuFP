@@ -69,6 +69,96 @@ It lands **within 0.005 dB** of what the entire power-of-two class can achieve, 
     count, same bits per block, same decode rule. An MXFP4 decoder reads this stream
     correctly with no changes at all.
 
+## The bracket rule: a multiplier-free encoder
+
+`OPT_SHIFT` above improves the *power-of-two* class. `BO2_BRACKET` does the same job one
+class up — for the **E4M3-scaled** formats, where NVFP4 lives — and it does it with no
+multiplier anywhere in the encoder.
+
+NVFP4's encoder is `S = R_{E4M3}(M/6)`, then every element is multiplied by `1/S` before
+rounding onto the E2M1 grid. That is a divide, a reciprocal, and a multiply per element.
+`BO2_BRACKET` replaces all three:
+
+1. **Bracket, don't divide.** The two grid scales surrounding `M/6` are found by
+   comparing `M` against precomputed `6S`. Writing `S = 2^e(8+j)/8`, we have
+   `6S = 2^{e+2}(24+3j)/16` — dyadic, so the comparison needs no divider.
+2. **Quantize by threshold, don't multiply.** Instead of scaling each element and
+   comparing against E2M1's cell boundaries, scale the **boundaries** once per block and
+   compare each element directly. The boundaries are
+   ``\{0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5\}`` — odd parts ``\{1,3,5,7\}`` only — and the
+   E2M1 grid itself is ``\{0, 0.5, 1, 1.5, 2, 3, 4, 6\}`` — odd parts ``\{1,3\}`` only.
+   So with `v = 8+j`, computing `{v, 3v, 5v, 7v}` costs **three adds**
+   (`3v = (v≪1)+v`, `5v = (v≪2)+v`, `7v = (v≪3)−v`), and every threshold and every
+   reconstruction level is then a pure **shift** of one of those four. Each element's
+   code is three comparisons.
+3. **Select on absolute error.** Score each candidate by ``\sum_i |x_i - S c_i|`` and keep
+   the smallest. Errors are subtracts, the metric is adds. **No squaring, and no
+   multiplier in the encoder at all.**
+
+![BO2-FP4 encoder](assets/fig_encode_bo2.svg)
+
+Every box in stages 2 and 3 is a comparator, a shift or an adder. Stage 1 avoids the
+divide by comparing `M` against `6S` rather than forming `M/6`; stage 2 builds all 15
+per-block constants from three adds; stage 3 codes each element by threshold comparison
+and scores it by subtraction and addition. Compare the NVFP4 encoder in
+[Block formats](@ref), where the same work needs a reciprocal and a full-width float
+multiply per element.
+
+### Why three candidates, and not more
+
+The rule selects on *absolute* error, which tracks squared error closely over a short
+bracket and drifts over a long one — L1 tolerates a few large residuals that L2 punishes,
+so a long candidate list pulls the choice toward over-aggressive overloading. Measured at
+`K = 16`, E4M3, Gaussian:
+
+| candidates | L1 SNR | L2 SNR | cost of using L1 |
+|---:|---:|---:|---:|
+| 2 | 20.956 | 21.057 | 0.101 |
+| **3** | **21.063** | 21.250 | 0.188 |
+| 4 | 20.964 | 21.256 | 0.292 |
+| 6+ | 20.945 | 21.256 | 0.311 |
+
+L2 improves monotonically and saturates at four. **L1 peaks at three and then gets
+absolutely worse.** The cheap metric is safe *because* the bracket is short, which is why
+[`BO2_NCAND`](@ref) is part of the rule rather than a knob to raise.
+
+### Measured
+
+Same wire format as NVFP4 throughout — same `K`, same E2M1 elements, same E4M3 scale,
+same decode path, same MAC:
+
+| scheme | bits | gaussian | outlier | student-t₃ | lognormal | QSNR p10 |
+|:---|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 4.250 | 18.80 | 14.92 | 16.87 | 16.64 | 17.31 |
+| NVFP4 | 4.500 | 20.44 | 20.91 | 21.04 | 20.65 | 18.66 |
+| **BO2-FP4 K=16** | 4.500 | **21.06** | **20.95** | **21.32** | **20.87** | **19.48** |
+| BO2-FP4 K=32 | 4.250 | 20.39 | 18.10 | 19.65 | 19.09 | 19.27 |
+| K16-E4M3-MSE_OPTIMAL | 4.500 | 21.59 | 21.02 | 21.63 | 21.16 | 20.29 |
+
+**+0.62 dB pooled and +0.82 dB on the tenth-percentile block over NVFP4**, on every
+distribution, for an encoder that is strictly cheaper than the one it replaces. The
+`K = 32` row is the same rule at MXFP4's bit rate: **+1.59 dB over MXFP4 for the same
+4.25 bits per value.**
+
+The last row is the ceiling: an exhaustive search over the same grid reaches 21.59 dB.
+The three-candidate bracket captures about two-thirds of that gain at a small fraction of
+the cost, which is the right place on the curve for an encoder that has to be cheap —
+compare [`MSE_OPTIMAL`](@ref ScaleRule), which evaluates roughly a dozen distinct scales
+and needs a squared-error accumulator to do it.
+
+!!! note "Regenerating the diagrams"
+    The figures are TikZ, with sources in `docs/tikz/` and rendered SVGs committed to
+    `docs/src/assets/`. Run `docs/tikz/build.sh` after editing a `.tex` — it needs
+    `pdflatex` and `pdf2svg`. The SVGs are committed precisely so the documentation CI
+    does **not** need a LaTeX toolchain. The sources are standalone, so they drop
+    straight into a paper.
+
+!!! note "Two separable ideas"
+    The threshold-comparison element coding of step 2 is **independent of the rest**. It
+    produces bit-identical output for *any* block format, including stock NVFP4, and
+    removes the per-element multiply and the reciprocal with no change in quality. Step 3
+    is what buys the decibels, at one comparison pass per candidate. Cost them separately.
+
 ## The schemes
 
 ```@docs

@@ -113,6 +113,152 @@ julia> round(measure_snr(MXFP4, x), digits=1)      # the report's 18.8 dB
 """
 measure_snr(fmt, x::AbstractVector) = snr_db(x, quantize_all(fmt, x))
 
+# ---- QSNR: the same ratio, but told block by block --------------------------
+
+"""
+    QSNR
+
+The quantization SNR of a format on a dataset, reported **pooled and per block**.
+
+# Fields
+- `pooled` — `10log₁₀(Σx² / Σ(x−q(x))²)` over the whole vector. This is the figure the
+  quantization literature usually prints as QSNR, and it is **numerically identical to
+  [`measure_snr`](@ref)** — the same ratio, energy-weighted across everything.
+- `mean`, `median`, `p10`, `p01`, `min` — the same ratio computed *within* each block of
+  `K`, then aggregated with every block counting equally.
+- `dead_blocks` — blocks whose QSNR fell to `≤ 0 dB`: the error carries at least as much
+  energy as the signal, so nothing survived.
+- `gap` — `pooled − p10`, how much better the headline number looks than the tenth
+  percentile block.
+
+!!! note "Why both numbers exist"
+    Pooling weights each block by its energy, so a high-energy block can carry the score
+    while a low-energy block is quietly ruined — the failure mode [`snr_db`](@ref) warns
+    about. On seeded `:sparse` data MXFP4 pools to **18.16 dB**, but its tenth-percentile
+    block is **14.81 dB** and its worst is **12.03 dB**: a `gap` of **+3.34 dB** between
+    the headline and the tail. Pooled QSNR answers "how much signal energy survived";
+    per-block QSNR answers "is there a block I ruined". Ship a format on the second.
+
+    Note that a block of *all zeros* is skipped, not scored. [`snr_db`](@ref) returns
+    `0.0` for a zero signal, and counting that as a 0 dB block would report empty data as
+    catastrophic damage.
+"""
+struct QSNR
+    format::String
+    n::Int
+    K::Int
+    nblocks::Int
+    pooled::Float64
+    mean::Float64
+    median::Float64
+    p10::Float64
+    p01::Float64
+    min::Float64
+    dead_blocks::Int
+    gap::Float64
+end
+
+_qsnr_K(fmt, K) = K === nothing ? _blocklen(fmt) : Int(K)
+
+"""
+    qsnr_blocks(fmt, x; K = nothing) -> Vector{Float64}
+
+QSNR in dB for each consecutive block of `K` values, `K` defaulting to the format's own
+block length (32 for formats that have none).
+
+Blocks whose signal energy is zero are dropped rather than reported as `0.0`; a block of
+zeros was not damaged, it was empty.
+"""
+function qsnr_blocks(fmt, x::AbstractVector; K = nothing)
+    k = _qsnr_K(fmt, K)
+    k > 0 || throw(ArgumentError("qsnr_blocks: K must be positive"))
+    xh = quantize_all(fmt, x)
+    out = Float64[]
+    n = length(x)
+    @inbounds for i in 1:k:n
+        j = min(i + k - 1, n)
+        sig = 0.0; noi = 0.0
+        for t in i:j
+            xt = Float64(x[t]); d = xt - Float64(xh[t])
+            sig += xt * xt; noi += d * d
+        end
+        sig == 0 && continue                       # an empty block, not a damaged one
+        push!(out, noi == 0 ? Inf : 10 * log10(sig / noi))
+    end
+    out
+end
+
+"""
+    measure_qsnr(fmt, x; K = nothing) -> QSNR
+
+Quantize `x` in `fmt` and report the full QSNR picture: the pooled figure plus the
+per-block distribution behind it.
+
+```julia
+julia> using Random
+
+julia> x = quick_data(:sparse, 200_000; rng = MersenneTwister(0));
+
+julia> q = measure_qsnr(MXFP4, x);
+
+julia> round.((q.pooled, q.p10, q.gap), digits = 2)
+(18.16, 14.81, 3.34)
+```
+
+The pooled column is what a paper reports; the `p10` and `dead_blocks` columns are what
+decide whether the format is safe to deploy.
+"""
+function measure_qsnr(fmt, x::AbstractVector; K = nothing)
+    k = _qsnr_K(fmt, K)
+    b = qsnr_blocks(fmt, x; K = k)
+    fin = filter(isfinite, b)
+    pooled = measure_snr(fmt, x)
+    nm = fmt isa AbstractString ? String(fmt) : string(_fmtname(fmt))
+    isempty(fin) && return QSNR(nm, length(x), k, length(b), pooled,
+                                Inf, Inf, Inf, Inf, Inf, 0, 0.0)
+    srt = sort(fin)
+    q(p) = srt[clamp(ceil(Int, p * length(srt)), 1, length(srt))]
+    p10 = q(0.10)
+    QSNR(nm, length(x), k, length(b), pooled,
+         sum(fin) / length(fin), q(0.50), p10, q(0.01), srt[1],
+         count(<=(0.0), fin), pooled - p10)
+end
+
+"""
+    qsnr(fmt, x; K = nothing, agg = :pooled) -> Float64
+
+One QSNR number, with the aggregation named explicitly.
+
+`agg` may be `:pooled` (energy-weighted over everything — the usual published figure,
+equal to [`measure_snr`](@ref)), or `:mean`, `:median`, `:p10`, `:p01`, `:min`, which
+weight every block of `K` equally.
+
+**The aggregation is not a detail.** Pooled and per-block medians agree to a tenth of a
+dB on well-behaved data and diverge by whole dB once the data has outliers or sparsity —
+which is exactly when you need the number.
+"""
+function qsnr(fmt, x::AbstractVector; K = nothing, agg::Symbol = :pooled)
+    agg === :pooled && return measure_snr(fmt, x)
+    r = measure_qsnr(fmt, x; K = K)
+    agg === :mean   ? r.mean   :
+    agg === :median ? r.median :
+    agg === :p10    ? r.p10    :
+    agg === :p01    ? r.p01    :
+    agg === :min    ? r.min    :
+    throw(ArgumentError("qsnr: agg must be :pooled, :mean, :median, :p10, :p01 or :min"))
+end
+
+function Base.show(io::IO, ::MIME"text/plain", q::QSNR)
+    println(io, "QSNR — ", q.format, " on ", q.n, " values, ", q.nblocks,
+            " blocks of ", q.K)
+    @printf(io, "  pooled       : %7.3f dB   (energy-weighted; == measure_snr)\n", q.pooled)
+    @printf(io, "  per-block    : mean %.3f, median %.3f dB\n", q.mean, q.median)
+    @printf(io, "  tails        : p10 %.3f, p01 %.3f, min %.3f dB\n", q.p10, q.p01, q.min)
+    @printf(io, "  dead blocks  : %d   (QSNR <= 0 dB — nothing survived)\n", q.dead_blocks)
+    @printf(io, "  gap          : %+.3f dB   (pooled − p10: how much the headline flatters)",
+            q.gap)
+end
+
 """
     per_element_relerror(fmt, x) -> Vector{Float64}
 

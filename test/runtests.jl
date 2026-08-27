@@ -2270,4 +2270,204 @@ end
     @test hls_energy_compare(; io = devnull) === nothing
 end
 
+
+@testset "QSNR: pooled identity, per-block distribution, streaming agreement" begin
+    rng = MersenneTwister(0)
+
+    # ---- the definitional point: pooled QSNR IS measure_snr ----------------
+    for d in (:gaussian, :uniform, :laplace, :student_t3, :lognormal, :sparse, :outlier)
+        x = quick_data(d, 50_000; rng = MersenneTwister(0))
+        for fmt in (MXFP4, NVFP4, MXINT4)
+            @test qsnr(fmt, x) == measure_snr(fmt, x)              # exactly, not approx
+            @test measure_qsnr(fmt, x).pooled == measure_snr(fmt, x)
+            @test qsnr(fmt, x; agg = :pooled) == measure_snr(fmt, x)
+        end
+    end
+
+    # ---- per-block aggregation is a genuinely different number -------------
+    x = quick_data(:sparse, 200_000; rng = MersenneTwister(0))
+    q = measure_qsnr(MXFP4, x)
+    @test q.K == MXFP4.K == 32
+    @test q.nblocks > 0
+    @test round(q.pooled, digits = 2) == 18.16      # pinned in analysis.md
+    @test round(q.p10,    digits = 2) == 14.81
+    @test round(q.min,    digits = 2) == 12.03
+    @test round(q.gap,    digits = 2) == 3.34
+    @test q.gap ≈ q.pooled - q.p10
+    # ordering the distribution must obey
+    @test q.min <= q.p01 <= q.p10 <= q.median
+    @test q.min <= q.mean
+    @test isfinite(q.mean) && isfinite(q.median)
+
+    # ---- agg keyword selects the right field -------------------------------
+    for (a, f) in ((:mean, q.mean), (:median, q.median), (:p10, q.p10),
+                   (:p01, q.p01), (:min, q.min))
+        @test qsnr(MXFP4, x; agg = a) == f
+    end
+    @test_throws ArgumentError qsnr(MXFP4, x; agg = :nonsense)
+    @test_throws ArgumentError qsnr_blocks(MXFP4, x; K = 0)
+
+    # ---- an all-zero block is skipped, not scored 0 dB ---------------------
+    # snr_db returns 0.0 for a zero signal; counting that as a dead block would
+    # report absent data as total destruction
+    z = vcat(zeros(64), randn(MersenneTwister(1), 64))
+    b = qsnr_blocks(MXFP4, z; K = 32)
+    @test length(b) == 2                      # 4 blocks of 32, two of them empty
+    @test all(>(0), b)
+    @test measure_qsnr(MXFP4, z; K = 32).dead_blocks == 0
+    @test snr_db(zeros(4), zeros(4)) == 0.0   # the convention that motivated the skip
+
+    # ---- K is honoured, and shorter blocks score better --------------------
+    xg = quick_data(:gaussian, 100_000; rng = MersenneTwister(0))
+    n4  = length(qsnr_blocks(MXFP4, xg; K = 4))
+    n64 = length(qsnr_blocks(MXFP4, xg; K = 64))
+    @test n4 > n64
+    @test n4 == cld(100_000, 4)
+    @test measure_qsnr(MXFP4, xg; K = 8).K == 8
+
+    # ---- the streaming path in quick_snr agrees with the reference ---------
+    for d in (:gaussian, :laplace, :student_t3, :sparse, :outlier)
+        x = quick_data(d, 100_000; rng = MersenneTwister(0))
+        qq = quick_snr(MXFP4, x; dataset = String(d))
+        rr = measure_qsnr(MXFP4, x)
+        @test qq.snr ≈ rr.pooled atol = 1e-9
+        @test qq.qsnr_median ≈ rr.median atol = 1e-9
+        @test qq.qsnr_p10 ≈ rr.p10 atol = 1e-9
+        @test qq.qsnr_min ≈ rr.min atol = 1e-9
+        @test qq.qsnr_gap ≈ qq.snr - qq.qsnr_p10
+        # and the pooled value is unchanged by the refactor
+        @test qq.snr ≈ measure_snr(MXFP4, x) atol = 1e-9
+    end
+
+    # ---- the tail exposes what pooling hides -------------------------------
+    # MXINT4 pools within ~1.2 dB of MXFP4 but its worst block is ~4 dB behind
+    xg = quick_data(:gaussian, 400_000; rng = MersenneTwister(0))
+    a = quick_snr(MXFP4, xg); b2 = quick_snr(MXINT4, xg)
+    @test a.snr - b2.snr < 1.5                      # headline gap is small
+    @test a.qsnr_min - b2.qsnr_min > 3.0            # tail gap is much larger
+    @test b2.qsnr_gap > a.qsnr_gap                  # and MXINT4 flatters itself more
+
+    # every scheme's headline is at least as good as its own tenth percentile
+    for bf in (MXFP4, NVFP4, MXINT4, fp4_variant(rule = OPT_SHIFT))
+        r = quick_snr(bf, xg)
+        @test r.qsnr_gap > 0
+        @test r.qsnr_min <= r.qsnr_p10 <= r.qsnr_median
+    end
+end
+
+
+@testset "BO2_BRACKET: multiplier-free scale rule" begin
+    bo2(K, sc) = fp4_variant(K = K, scale = sc, rule = BO2_BRACKET)
+    nv(K, sc)  = fp4_variant(K = K, scale = sc, rule = NV_MAXDIV)
+
+    # ---- the constant is part of the rule, not a knob ----------------------
+    @test BO2_NCAND == 3
+    @test BO2_BRACKET isa ScaleRule
+    @test BO2_BRACKET in instances(ScaleRule)
+
+    # ---- the wire format is NVFP4's, untouched -----------------------------
+    for K in (16, 32)
+        a = bo2(K, E4M3); b = nv(K, E4M3)
+        @test bits_per_element(a) == bits_per_element(b)
+        @test bits_per_block(a) == bits_per_block(b)
+        @test a.K == b.K && a.elem === b.elem && a.scale === b.scale
+    end
+
+    # ---- the scale-grid helpers, checked EXHAUSTIVELY ----------------------
+    # every positive value of the scale format must step to its exact neighbour,
+    # including across the binade boundary and down the uniform subnormal ramp
+    for sf in (E4M3, E5M2)
+        g = sort(filter(v -> v > 0 && isfinite(v), grid(sf)))
+        for i in 2:length(g)
+            @test xpuFP._scale_grid_down(sf, g[i]) == g[i-1]
+        end
+        @test xpuFP._scale_grid_down(sf, g[1]) == 0.0    # below the smallest
+        for t in g
+            c = xpuFP._scale_grid_ceil(sf, t)
+            @test c == t                                  # already representable
+        end
+        for i in 2:length(g)
+            t = (g[i-1] + g[i]) / 2                       # strictly between two codes
+            c = xpuFP._scale_grid_ceil(sf, t)
+            @test c == g[i] && c >= t
+        end
+    end
+    # the subnormal ramp is uniform, not logarithmic — the bug this caught
+    @test minnormal(E4M3) == 0.015625
+    @test xpuFP._scale_grid_down(E4M3, minnormal(E4M3)) ==
+          minnormal(E4M3) - minsubnormal(E4M3)
+    @test quantize(E4M3, xpuFP._scale_grid_down(E4M3, 0.0136719)) ==
+          xpuFP._scale_grid_down(E4M3, 0.0136719)
+    # stepping down crosses a binade cleanly
+    @test xpuFP._scale_grid_down(E4M3, 1.0) ≈ 0.9375     # 2^-1 * (1 + 7/8)
+    @test xpuFP._scale_grid_ceil(E4M3, 1.0) == 1.0       # already representable
+
+    # ---- the fast path reproduces the reference exactly --------------------
+    for d in (:gaussian, :outlier, :student_t3, :lognormal, :sparse)
+        x = quick_data(d, 60_000; rng = MersenneTwister(0))
+        for K in (16, 32)
+            f = bo2(K, E4M3)
+            @test quick_snr(f, x).snr ≈ measure_snr(f, x) atol = 1e-9
+        end
+    end
+
+    # ---- it beats NV_MAXDIV at the same wire format ------------------------
+    for d in (:gaussian, :outlier, :student_t3, :lognormal)
+        x = quick_data(d, 200_000; rng = MersenneTwister(0))
+        a = quick_snr(bo2(16, E4M3), x)
+        b = quick_snr(nv(16, E4M3), x)
+        @test a.snr > b.snr                       # strictly better, every dataset
+        @test a.qsnr_p10 > b.qsnr_p10             # and the tail improves too
+    end
+    let x = quick_data(:gaussian, 400_000; rng = MersenneTwister(0))
+        a = quick_snr(bo2(16, E4M3), x); b = quick_snr(NVFP4, x)
+        @test a.snr - b.snr > 0.5                 # ~+0.62 dB on gaussian
+        @test a.qsnr_p10 - b.qsnr_p10 > 0.7       # ~+0.82 dB on the p10 block
+        # ...and still below an exhaustive search, which is the point of it being cheap
+        @test a.snr < quick_snr(fp4_variant(K = 16, scale = E4M3, rule = MSE_OPTIMAL), x).snr
+    end
+
+    # ---- WHY ncand = 3: L1 peaks there and then degrades -------------------
+    # the justification for the constant, pinned so it cannot drift
+    let x = quick_data(:gaussian, 200_000; rng = MersenneTwister(0)),
+        f = bo2(16, E4M3), K = 16
+        function l1_snr(nc)
+            sig = 0.0; noi = 0.0
+            for i in 1:K:length(x)
+                blk = view(x, i:min(i + K - 1, length(x)))
+                S = xpuFP._bo2_bracket_scale(f, blk; ncand = nc)
+                for v in blk
+                    d = v - quantize(E2M1, v / S) * S
+                    sig += v * v; noi += d * d
+                end
+            end
+            10 * log10(sig / noi)
+        end
+        s2, s3, s6 = l1_snr(2), l1_snr(3), l1_snr(6)
+        @test s3 > s2                  # three beats two
+        @test s3 > s6                  # ...and beats six: L1 degrades past the peak
+        @test s6 < s2                  # a long bracket is worse than the shortest one
+    end
+
+    # ---- the L1 metric itself ----------------------------------------------
+    let f = bo2(16, E4M3), blk = randn(MersenneTwister(3), 16)
+        S = xpuFP._bo2_bracket_scale(f, blk)
+        @test S > 0 && isfinite(S)
+        @test quantize(E4M3, S) == S                       # representable scale
+        @test xpuFP._block_sae(f, blk, S) >= 0
+        @test xpuFP._block_sae(f, blk, -1.0) == Inf
+        # L1 of an exactly-representable block is zero
+        g = Float64[2.0, 4.0, 6.0, 1.0]
+        @test xpuFP._block_sae(f, g, 1.0) == 0.0
+    end
+    @test xpuFP._bo2_bracket_scale(bo2(16, E4M3), zeros(16)) == 1.0
+
+    # ---- K=32 at MXFP4's bit rate ------------------------------------------
+    let x = quick_data(:gaussian, 400_000; rng = MersenneTwister(0))
+        a = quick_snr(bo2(32, E4M3), x)
+        @test bits_per_element(bo2(32, E4M3)) == bits_per_element(MXFP4) == 4.25
+        @test a.snr > quick_snr(MXFP4, x).snr + 1.0   # +1.6 dB at the same bit cost
+    end
+end
+
 end

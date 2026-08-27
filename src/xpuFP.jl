@@ -58,7 +58,8 @@ export IntFormat, INT4, INT8, ElementFormat, intmin
 export DigitFormat, RR4, RR4_MAX, CSD, SIGNED_BINARY, BINARY, RADIX4
 export ALL_DIGIT_FORMATS, alphabet, to_digits, conforms, radix_parts
 export BlockFormat, ScaleRule, QuantizedBlock, BlockDotResult
-export MX_FLOOR_POW2, NV_MAXDIV, BEST_POW2, MSE_OPTIMAL, OPT_SHIFT
+export MX_FLOOR_POW2, NV_MAXDIV, BEST_POW2, MSE_OPTIMAL, OPT_SHIFT, BO2_BRACKET
+export BO2_NCAND
 export MXFP4, NVFP4, MXINT4, ALL_BLOCK_FORMATS
 export elem_emax, bits_per_element, bits_per_block, block_scale
 export quantize_block, quantize_blocked, dequantize, reconstruct
@@ -82,6 +83,7 @@ export QuickSNR, quick_snr, quick_data, quick_compare, quick_sweep, fp4_variant
 export DB_PER_BIT, LOG_UNIFORM_INV_SQ
 export snr_db, effective_bits, rel_rms_error, cosine_similarity, cosine_from_snr
 export quantize_all, measure_snr, per_element_relerror
+export QSNR, qsnr, qsnr_blocks, measure_qsnr
 export db_per_bit, resolution_fraction, predicted_snr
 
 # ---- redundant number systems ----------------------------------------------

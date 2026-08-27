@@ -17,3 +17,10 @@
 .vscode/
 .idea/
 *.swp
+
+# LaTeX intermediates from docs/tikz/build.sh (the rendered SVGs ARE committed,
+# so the documentation CI needs no LaTeX toolchain)
+/docs/tikz/build/
+*.aux
+*.log
+*.synctex.gz
