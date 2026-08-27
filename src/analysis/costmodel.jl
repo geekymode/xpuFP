@@ -193,6 +193,111 @@ function multiply_costs(n::Integer)
 end
 
 """
+    booth_vs_rr4(n::Integer) -> Vector{NamedTuple}
+
+**Booth radix-4 against an RR4 multiplier at width `n`** — a comparison that is easy to
+get backwards, because the two schemes recode into *the same alphabet*.
+
+`booth_radix4` emits digits in `{-2,-1,0,1,2}`. So does [`to_rr4`](@ref). They are the
+same signed-digit set; what differs is **what the redundancy is spent on**:
+
+| | Booth radix-4 | RR4 |
+|:---|:---|:---|
+| recodes | **one** operand, inside the multiplier | **both** operands, in the representation |
+| redundancy is | transient — discarded at the exit | persistent — carried in registers |
+| buys | half the partial-product **rows** | carry-free **addition** |
+| leaves behind | `⌈(n+1)/2⌉` rows of full width | `⌈n/2⌉²` digit products |
+| reduction cost | carry-save, **1 gate per level** | RR4, **3 gates per level** |
+
+The rows column is the whole story. Booth turns `n` rows into `n/2`; decomposing *both*
+operands into digits turns them into `n²/4` **terms**, a quadratic blow-up in what the
+tree has to reduce — and each RR4 level costs three gates where a 3:2 compressor costs
+one. The two effects compound, and the result is that RR4 multiplication is roughly
+**twice the depth of Booth at every width**, with no crossover.
+
+The reason is worth stating plainly, because it generalises:
+
+> Booth spends redundancy on **row count**. RR4 spends it on **carry propagation**. Inside
+> a multiplier the row count is the binding constraint, and carry propagation was already
+> solved — for one gate per level — by the carry-save tree. RR4 is paying a second time
+> for something the Wallace tree gives away.
+
+The `:rr4_carried` row is the steelman: operands arriving *already* in RR4 and leaving in
+RR4, so neither recoding nor exit conversion is charged. It is still about twice Booth's
+depth, because the `n²/4` term count is intrinsic to decomposing both operands.
+
+```julia
+julia> [r.depth for r in booth_vs_rr4(24)]     # array, booth, rr4, rr4-carried
+4-element Vector{Int64}:
+ 13
+ 12
+ 28
+ 24
+```
+
+Where RR4 *does* win is [`accumulate_costs`](@ref): a dependent accumulation loop, where
+depth really is the initiation interval and there is no tree to hide behind.
+"""
+function booth_vs_rr4(n::Integer)
+    N = Int(n)
+    N > 1 || throw(ArgumentError("booth_vs_rr4: n must exceed 1"))
+    plain, booth = booth_rows(N)
+    lv(rows)  = length(reduction_schedule(max(2, rows))) - 1     # carry-save levels
+    rlv(rows) = 3 * max(1, ceil(Int, log2(max(2, rows))))        # RR4: 3 gates per level
+    cpa = max(1, ceil(Int, log2(2N)))
+    dg  = cld(N, 2)
+    prods = dg^2
+    # a digit PRODUCT lands in {-4..4}, so 4 bits — not the 3 a {-2..2} digit needs
+    rr4_tree_cells = max(0, 4 * prods - 4N)      # PP bits to eliminate, 4 per digit product
+
+    [(method = :array, terms = plain, levels = lv(plain),
+      depth = lv(plain) + cpa, cells = plain * N + compressor_cells(plain) * 2N,
+      state_bits = plain * 2N, redundant_out = false,
+      note = "$(plain) rows, no recoding, carry-save tree, one exit CPA"),
+
+     (method = :booth_r4, terms = booth, levels = lv(booth),
+      depth = 1 + lv(booth) + cpa,
+      cells = 5booth + round(Int, booth * N * 1.3) + compressor_cells(booth) * 2N,
+      state_bits = booth * 2N, redundant_out = false,
+      note = "$(booth) rows after recoding ONE operand; digits in {-2..2}"),
+
+     # A digit product spans 4 bits, not the full 2N — charging the tree at full width
+     # would overcharge RR4 roughly sevenfold. Count the bits that actually have to be
+     # eliminated instead: 4 per term, down to two 2N-wide words.
+     (method = :rr4_recoded, terms = prods, levels = rlv(prods) ÷ 3,
+      depth = 1 + rlv(prods) + 3,
+      cells = prods * 4 + rr4_tree_cells,
+      state_bits = prods * 4, redundant_out = false,
+      note = "$(dg)x$(dg) digit products from recoding BOTH operands, then exit conversion"),
+
+     (method = :rr4_carried, terms = prods, levels = rlv(prods) ÷ 3,
+      depth = rlv(prods),
+      cells = prods * 4 + rr4_tree_cells,
+      state_bits = prods * 4, redundant_out = true,
+      note = "the steelman: RR4 in, RR4 out — no recode, no exit conversion")]
+end
+
+"""
+    booth_vs_rr4_report(; ns = (8, 16, 24, 32, 53, 64), io = stdout) -> Nothing
+
+Sweep [`booth_vs_rr4`](@ref) across widths and print the depth ratio. The ratio is flat
+near **2×** from 8 bits to 64 — RR4 never catches up, at any width.
+"""
+function booth_vs_rr4_report(; ns = (8, 16, 24, 32, 53, 64), io::IO = stdout)
+    @printf(io, "  %5s | %7s %7s %8s | %8s %7s %8s | %9s\n",
+            "n", "B rows", "B lvls", "B depth", "R terms", "R lvls", "R depth", "R/B")
+    println(io, "  " * "-"^74)
+    for n in ns
+        r = booth_vs_rr4(n)
+        b = r[findfirst(x -> x.method === :booth_r4, r)]
+        q = r[findfirst(x -> x.method === :rr4_recoded, r)]
+        @printf(io, "  %5d | %7d %7d %8d | %8d %7d %8d | %8.2fx\n",
+                n, b.terms, b.levels, b.depth, q.terms, q.levels, q.depth, q.depth / b.depth)
+    end
+    nothing
+end
+
+"""
     constant_multiply_costs(c::Integer, w::Integer=32) -> NamedTuple
 
 Price multiplying a `w`-bit variable by the **constant** `c`, binary shift-add against

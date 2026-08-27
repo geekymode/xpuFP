@@ -2470,4 +2470,78 @@ end
     end
 end
 
+
+@testset "Booth radix-4 vs an RR4 multiplier" begin
+    # ---- the fact that makes them confusable: SAME alphabet ---------------
+    for v in (13, 182, 1023, -74, 65535)
+        w = 20
+        bd = booth_radix4(v, w).digits
+        @test all(d -> -2 <= d <= 2, bd)                # Booth emits {-2..2}
+        @test value(booth_radix4(v, w)) == v            # ...and reconstructs
+    end
+    for v in (13, 182, 1023, 65535)
+        @test all(d -> -2 <= d <= 2, to_rr4(v).digits)  # RR4 minimal: the same set
+    end
+
+    # ---- the structural difference: rows vs terms --------------------------
+    for n in (8, 16, 24, 32, 53, 64)
+        r = booth_vs_rr4(n)
+        m(k) = r[findfirst(x -> x.method === k, r)]
+        b, q, c = m(:booth_r4), m(:rr4_recoded), m(:rr4_carried)
+        _, br = booth_rows(n)
+        @test b.terms == br                       # Booth HALVES the rows
+        @test b.terms <= cld(n + 1, 2)
+        @test q.terms == cld(n, 2)^2              # RR4 SQUARES them
+        @test c.terms == q.terms
+        @test q.terms > b.terms                   # quadratic blow-up, every width
+
+        # depth: RR4 is ~2x Booth and never catches up
+        @test q.depth > b.depth
+        @test 1.9 <= q.depth / b.depth <= 2.8
+        @test c.depth < q.depth                   # the steelman saves the conversions
+        @test c.depth > b.depth                   # ...and still loses
+        @test c.depth / b.depth >= 1.5
+
+        # RR4 is competitive on the other two currencies, which is the honest part:
+        # state lands within ~12% of Booth either way, and the sign follows the parity
+        # of n, because ceil(n/2) rounds up at odd widths and is then squared
+        @test 0.79 <= q.state_bits / b.state_bits <= 1.12
+        @test (q.state_bits < b.state_bits) == iseven(n)
+        @test q.cells < m(:array).cells
+        @test q.redundant_out == false && c.redundant_out == true
+    end
+
+    # ---- consistency with multiply_costs -----------------------------------
+    for n in (8, 16, 24, 53)
+        mc = multiply_costs(n)
+        bw = mc[findfirst(x -> x.method === :booth_wallace, mc)]
+        bv = booth_vs_rr4(n)[findfirst(x -> x.method === :booth_r4, booth_vs_rr4(n))]
+        @test bv.cells == bw.cells                # same model, same answer
+        @test bv.depth == bw.depth
+    end
+
+    # ---- pinned numbers at the FP32 significand ----------------------------
+    let r = booth_vs_rr4(24), m(k) = r[findfirst(x -> x.method === k, r)]
+        @test m(:booth_r4).terms == 13 && m(:booth_r4).depth == 12
+        @test m(:rr4_recoded).terms == 144 && m(:rr4_recoded).depth == 28
+        @test m(:rr4_carried).depth == 24
+        @test m(:array).terms == 24
+        @test m(:rr4_recoded).state_bits == 144 * 4      # {-4..4} needs 4 bits
+    end
+
+    # ---- the ratio is flat, not width-dependent ----------------------------
+    let ratios = [begin
+                     r = booth_vs_rr4(n)
+                     q = r[findfirst(x -> x.method === :rr4_recoded, r)]
+                     b = r[findfirst(x -> x.method === :booth_r4, r)]
+                     q.depth / b.depth
+                  end for n in (8, 16, 24, 32, 53, 64)]
+        @test maximum(ratios) - minimum(ratios) < 0.5    # no trend, just ~2x
+        @test all(>(1.9), ratios)
+    end
+
+    @test_throws ArgumentError booth_vs_rr4(1)
+    @test booth_vs_rr4_report(; ns = (8, 24), io = devnull) === nothing
+end
+
 end

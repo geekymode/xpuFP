@@ -135,6 +135,7 @@ export csd_constant_multiply, rr4_multiply, compare_multipliers
 export rr4_recode, rr4_recode_table, AccumulatorRun, accumulator_inputs
 export accumulate_rr4, accumulate_carry, compare_accumulators, accumulator_scaling
 export CostBudget, RR4_BITS_PER_DIGIT, BINARY_BITS_PER_RADIX4_DIGIT
+export booth_vs_rr4, booth_vs_rr4_report
 export add_costs, accumulate_costs, multiply_costs, constant_multiply_costs
 export cost_report, format_memory_costs
 export mxfp4_widths, sign_detect_depth, mxfp4_multiply_options

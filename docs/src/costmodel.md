@@ -1098,6 +1098,97 @@ not in speed.
   (both are serial). Against `sum_lanes8` it would be ~140×, but that would be comparing
   a scalar chain to a vectorised one.
 
+## 14. Booth radix-4 against an RR4 multiplier
+
+These two are constantly conflated, and the reason is a genuine fact rather than a
+confusion: **they recode into the same alphabet.**
+
+```julia-repl
+julia> booth_radix4(182, 9).digits        # {-2..2}
+5-element Vector{Int64}:
+ -2   2  -1  -1   1
+
+julia> to_rr4(182).digits                 # also {-2..2}
+5-element Vector{Int64}:
+  2   1  -1  -1   1
+```
+
+Booth radix-4 recoding **is** a minimally-redundant radix-4 recoding. Same digit set,
+same `O(1)` parallel window, same absence of carry propagation. So the difference cannot
+be in the representation. It is in **what the redundancy is spent on**.
+
+### The distinction
+
+| | Booth radix-4 | RR4 |
+|:---|:---|:---|
+| recodes | **one** operand, inside the multiplier | **both** operands, in the representation |
+| redundancy is | transient — discarded at the exit | persistent — carried in registers |
+| buys | half the partial-product **rows** | carry-free **addition** |
+| leaves the tree | `⌈(n+1)/2⌉` rows of full width | `⌈n/2⌉²` digit products |
+| reduction cost | carry-save, **1 gate per level** | RR4, **3 gates per level** |
+| result | binary, after one exit CPA | redundant, unless converted |
+
+The row column is the whole story, and it is quadratic. Booth turns `n` rows into `n/2`.
+Decomposing *both* operands into digits turns them into `n²/4` **terms** — for a 24-bit
+significand, 13 rows against 144 digit products. Then each RR4 reduction level costs three
+gates where a 3:2 compressor costs one. The two effects compound.
+
+```@example cm
+using xpuFP # hide
+booth_vs_rr4_report()
+```
+
+**Flat at roughly 2× from 8 bits to 64.** There is no width at which RR4 multiplication
+catches up, because the `n²/4` term count is intrinsic to decomposing both operands, not
+an artefact of any particular tree.
+
+### The one-line reason
+
+> Booth spends redundancy on **row count**. RR4 spends it on **carry propagation**.
+> Inside a multiplier the row count is the binding constraint — and carry propagation was
+> already solved, for one gate per level, by the carry-save tree. RR4 pays a second time
+> for something a Wallace tree gives away.
+
+That is the general form of a result this document keeps reaching from different
+directions: [§4](@ref "4. Reduction trees") ranks carry-save above RR4 for exactly this
+reason, and [§12](@ref "12. How close can a multiply get to one cycle?") finds that
+dropping the exit CPA — keeping the *product* carry-save — is worth six levels, while RR4
+recoding the operands is worth nothing.
+
+### It is not a rout
+
+Priced in all three currencies at `n = 24`, with the digit-product tree charged by the
+bits it actually has to eliminate rather than at full datapath width:
+
+```@example cm
+for r in booth_vs_rr4(24)
+    println(rpad(r.method, 14), " terms ", lpad(r.terms, 4),
+            "  depth ", lpad(r.depth, 3), "  cells ", lpad(r.cells, 5),
+            "  state ", lpad(r.state_bits, 5))
+end
+```
+
+RR4 is **competitive in cells and level with Booth on state** — the digit products are
+4-bit objects, so there are many of them but each is tiny. The state comparison has a
+tidy quirk: RR4 holds *fewer* bits at even widths and *more* at odd ones (0.80× at
+`n = 8`, 1.11× at `n = 9`, converging to 1.0 from both sides), because `⌈n/2⌉` rounds up
+at odd `n` and then gets squared.
+
+What RR4 loses, decisively, is depth: 24–28 levels against Booth's 12.
+
+So the verdict is not "RR4 is a bad multiplier" but something sharper: **RR4 is a bad
+answer to the question a multiplier asks.** Give it a question about a *dependent
+accumulation*, where depth really is the initiation interval and there is no tree to hide
+behind, and the ranking inverts — that is [`accumulate_costs`](@ref) and
+[§11](@ref "11. Pipelining — buying throughput with registers, not with logic").
+
+!!! note "Where the `rr4_carried` row comes from"
+    That row is the steelman: operands arriving *already* in RR4 and leaving in RR4, so
+    neither the recode nor the exit conversion is charged to the multiplier. It is the
+    fairest case RR4 has, and it is still twice Booth's depth. If a design is already
+    carrying RR4 for its accumulator, this is the row that tells it what the multiplier
+    will cost.
+
 ## Known simplifications
 
 Stated with their **direction**, because a bias that flatters the conclusion is worth
